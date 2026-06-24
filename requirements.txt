@@ -1,0 +1,26 @@
+# Core (all platforms) ------------------------------------------------------
+numpy>=1.24
+mido>=1.3
+python-rtmidi>=1.5          # real MIDI I/O backend for mido
+pretty_midi>=0.2.10         # attribute extraction from generated MIDI
+huggingface_hub>=0.23       # weight downloads
+
+# GUI (local web app) --------------------------------------------------------
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+
+# VAE latent backends (PyTorch / MPS on Apple Silicon, CPU elsewhere) --------
+# Install a build matching your platform; on Apple Silicon the default wheel
+# ships MPS support: pip install torch
+torch>=2.3
+
+# Apple-Silicon real-time engine (the two plain-Aria models) -----------------
+# These are macOS/arm64 only and pulled in by the EleutherAI aria package.
+# On macOS:  pip install "mlx<=0.26" "aria @ git+https://github.com/EleutherAI/aria"
+# (aria also installs ariautils). They are intentionally NOT pinned here so the
+# repo imports cleanly on Linux for the latent-only path. See README.
+#
+#   mlx<=0.26
+#   aria @ git+https://github.com/EleutherAI/aria
+#   ariautils @ git+https://github.com/EleutherAI/aria-utils

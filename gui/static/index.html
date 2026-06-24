@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aria Realtime Latent Studio</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2027; --acc:#5aa0ff; --txt:#e7e9ee; --mut:#8b93a3; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { padding:14px 20px; border-bottom:1px solid #2a2e37; display:flex;
+           align-items:center; gap:14px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .badge { font-size:11px; color:var(--mut); border:1px solid #333; padding:2px 8px;
+           border-radius:10px; }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:18px; padding:18px 20px; }
+  .panel { background:var(--panel); border:1px solid #2a2e37; border-radius:10px;
+           padding:14px 16px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+              color:var(--mut); margin:0 0 10px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 3px; }
+  select, button, input[type=text] { width:100%; padding:8px; background:#0f1115;
+           color:var(--txt); border:1px solid #313640; border-radius:7px; font-size:13px; }
+  button { cursor:pointer; background:var(--acc); color:#06101f; border:none; font-weight:600; }
+  button.sec { background:#262b34; color:var(--txt); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  .slider { margin:14px 0; }
+  .slider .top { display:flex; justify-content:space-between; font-size:12px; }
+  .slider .lab { color:var(--txt); }
+  .slider .val { color:var(--acc); font-variant-numeric:tabular-nums; }
+  .slider .r2 { color:var(--mut); font-size:11px; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  #log { font:12px ui-monospace,Menlo,monospace; color:var(--mut); white-space:pre-wrap;
+         max-height:220px; overflow:auto; background:#0f1115; padding:10px; border-radius:7px; }
+  .hide { display:none; }
+  .pill { font-size:11px; padding:1px 7px; border-radius:9px; }
+  .pill.mlx { background:#2b2140; color:#c9a8ff; }
+  .pill.torch { background:#13312a; color:#7fe0bd; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aria Realtime Latent Studio</h1>
+  <span class="badge">macOS / Apple Silicon</span>
+  <span class="badge" id="midiState">WebMIDI: …</span>
+</header>
+
+<main>
+  <!-- LEFT: model + transport + devices -->
+  <section class="panel">
+    <h2>Model</h2>
+    <select id="modelSel"></select>
+    <p id="modelNote" class="r2" style="color:var(--mut);font-size:12px;margin:8px 0"></p>
+
+    <h2 style="margin-top:18px">MIDI devices</h2>
+    <label>Output (server / Core MIDI)</label>
+    <select id="midiOut"></select>
+    <label>Input (server, live play)</label>
+    <select id="midiIn"></select>
+    <label>Browser playback output (WebMIDI)</label>
+    <select id="webOut"></select>
+
+    <h2 style="margin-top:18px">Transport</h2>
+    <div class="row">
+      <button id="btnStart">Load &amp; Start</button>
+      <button id="btnStop" class="sec">Stop</button>
+    </div>
+    <p class="r2" style="font-size:11px;margin-top:8px">
+      Plain-Aria models stream continuations live to the server MIDI output.
+      VAE models generate on demand from the sliders below.
+    </p>
+  </section>
+
+  <!-- RIGHT: latent controls -->
+  <section class="panel" id="latentPanel">
+    <h2>Latent controls (VAE only)</h2>
+
+    <div id="latentBody" class="hide">
+      <label>Seed piece</label>
+      <div class="row">
+        <select id="seedSel"></select>
+        <button id="btnEncode" class="sec" style="flex:0 0 110px">Encode → z</button>
+      </div>
+
+      <div id="sliders"></div>
+
+      <label>Sampling</label>
+      <div class="row">
+        <span>
+          <span class="r2">temperature</span>
+          <input id="temp" type="range" min="0.5" max="1.4" step="0.05" value="0.95">
+        </span>
+        <span>
+          <span class="r2">top-p</span>
+          <input id="topp" type="range" min="0.5" max="1.0" step="0.02" value="0.9">
+        </span>
+      </div>
+
+      <div class="row" style="margin-top:14px">
+        <button id="btnGen">Generate from z + sliders</button>
+        <button id="btnRand" class="sec" style="flex:0 0 130px">Random z</button>
+      </div>
+      <p class="r2" style="font-size:11px;margin-top:6px">
+        z' = z + Σ α·ŵ<sub>attr</sub> — each slider adds its attribute direction
+        (from the ridge probe) before decoding. R² shows how reliably z carries
+        that attribute.
+      </p>
+    </div>
+
+    <p id="latentHint" class="r2">Select a VAE model (AriaVAE / Cadenza) and press
+      Load &amp; Start to reveal the sliders.</p>
+
+    <h2 style="margin-top:18px">Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = m => { const l=$("#log"); l.textContent += m+"\n"; l.scrollTop=l.scrollHeight; };
+let MODELS = [], CURRENT = null, WEBMIDI = null, WEBOUT = null;
+
+async function jget(u){ const r=await fetch(u); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function jpost(u,b){ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
+  if(!r.ok) throw new Error(await r.text()); return r; }
+
+async function initMidi(){
+  if(!navigator.requestMIDIAccess){ $("#midiState").textContent="WebMIDI: unsupported"; return; }
+  try{
+    WEBMIDI = await navigator.requestMIDIAccess({sysex:false});
+    $("#midiState").textContent = "WebMIDI: ready";
+    const outs=[...WEBMIDI.outputs.values()];
+    $("#webOut").innerHTML = outs.map(o=>`<option value="${o.id}">${o.name}</option>`).join("")
+       || `<option value="">(no WebMIDI outputs)</option>`;
+    $("#webOut").onchange = ()=>{ WEBOUT = WEBMIDI.outputs.get($("#webOut").value); };
+    WEBOUT = outs[0] || null;
+  }catch(e){ $("#midiState").textContent="WebMIDI: denied"; }
+}
+
+async function loadModels(){
+  MODELS = await jget("/api/models");
+  $("#modelSel").innerHTML = MODELS.map(m=>{
+    const dl = m.downloaded ? "" : " (missing)";
+    return `<option value="${m.key}">${m.display_name}${dl}</option>`;
+  }).join("");
+  $("#modelSel").onchange = onModelChange;
+  onModelChange();
+}
+
+function curModel(){ return MODELS.find(m=>m.key===$("#modelSel").value); }
+function onModelChange(){
+  const m = curModel();
+  $("#modelNote").textContent = m ? `[${m.backend}] ${m.notes}` : "";
+}
+
+async function loadPorts(){
+  const p = await jget("/api/midi_ports");
+  $("#midiOut").innerHTML = (p.outputs||[]).map(n=>`<option>${n}</option>`).join("")||`<option value="">(none)</option>`;
+  $("#midiIn").innerHTML = `<option value="">(none / control via keyboard)</option>`+
+     (p.inputs||[]).map(n=>`<option>${n}</option>`).join("");
+}
+
+async function loadSeeds(){
+  const s = await jget("/api/seed_midi");
+  $("#seedSel").innerHTML = (s.length? s : ["(put .mid files in assets/seed_midi/)"])
+     .map(n=>`<option>${n}</option>`).join("");
+}
+
+async function buildSliders(){
+  const a = await jget("/api/latent/attributes");
+  $("#sliders").innerHTML = a.attributes.map(at=>{
+    const r2 = at.r2==null ? "" : `R²=${at.r2}`;
+    return `<div class="slider" data-attr="${at.name}">
+      <div class="top"><span class="lab">${at.label}</span>
+        <span class="val">0.0</span></div>
+      <input type="range" min="-3" max="3" step="0.1" value="0">
+      <div class="r2">${r2}${a.probe_ready?"":" — probe not built (slider inert)"}</div>
+    </div>`;
+  }).join("");
+  $("#sliders").querySelectorAll(".slider").forEach(s=>{
+    const r=s.querySelector("input"), v=s.querySelector(".val");
+    r.oninput=()=>{ v.textContent=(+r.value).toFixed(1); };
+  });
+}
+
+function collectOffsets(){
+  const o={};
+  $("#sliders").querySelectorAll(".slider").forEach(s=>{
+    const a=s.dataset.attr, val=+s.querySelector("input").value;
+    if(Math.abs(val)>1e-9) o[a]=val;
+  });
+  return o;
+}
+
+// Minimal MIDI-file parser -> schedule note events to WebMIDI output.
+async function playMidiBlob(buf){
+  if(!WEBOUT){ log("No WebMIDI output selected; file saved server-side only."); return; }
+  const ev = parseMidi(new Uint8Array(buf));
+  const t0 = performance.now();
+  for(const e of ev){
+    const when = t0 + e.t*1000;
+    const d = Math.max(0, when - performance.now());
+    setTimeout(()=>{ try{ WEBOUT.send(e.data);}catch(_){} }, d);
+  }
+  log(`Playing ${ev.length} MIDI events via ${WEBOUT.name}.`);
+}
+
+// Tiny SMF parser: returns [{t(sec), data:[status,d1,d2]}], tempo-aware.
+function parseMidi(b){
+  let p=0; const u32=()=>((b[p++]<<24)|(b[p++]<<16)|(b[p++]<<8)|b[p++])>>>0;
+  const u16=()=>((b[p++]<<8)|b[p++]);
+  if(String.fromCharCode(b[0],b[1],b[2],b[3])!=="MThd") return [];
+  p=8; u16(); const ntrk=u16(); const div=u16();
+  let evs=[], tempo=500000;
+  for(let tr=0;tr<ntrk;tr++){
+    if(String.fromCharCode(b[p],b[p+1],b[p+2],b[p+3])!=="MTrk"){break;} p+=4;
+    const len=u32(); const end=p+len; let tick=0, run=0;
+    const vlq=()=>{let v=0,c;do{c=b[p++];v=(v<<7)|(c&0x7f);}while(c&0x80);return v;};
+    while(p<end){
+      tick+=vlq(); let s=b[p];
+      if(s<0x80){ s=run; } else { p++; run=s; }
+      if(s===0xff){ const t=b[p++]; const l=vlq();
+        if(t===0x51){ tempo=(b[p]<<16)|(b[p+1]<<8)|b[p+2]; }
+        p+=l; continue; }
+      if(s===0xf0||s===0xf7){ const l=vlq(); p+=l; continue; }
+      const d1=b[p++]; const hi=s&0xf0;
+      const d2=(hi===0xc0||hi===0xd0)?0:b[p++];
+      evs.push({tick, data:[s,d1,d2]});
+    }
+    p=end;
+  }
+  evs.sort((a,b)=>a.tick-b.tick);
+  // ticks -> seconds (assumes division is ticks-per-quarter; ignores SMPTE).
+  return evs.map(e=>({t:(e.tick/div)*(tempo/1e6), data:e.data}));
+}
+
+// --- wiring ---
+$("#modelSel").addEventListener("change", ()=>{ CURRENT=null; });
+
+$("#btnStart").onclick = async ()=>{
+  const m = curModel();
+  try{
+    if(m.backend==="mlx"){
+      await jpost("/api/realtime/start", {
+        model_key:m.key, midi_out:$("#midiOut").value,
+        midi_in:$("#midiIn").value||null, temperature:+$("#temp").value });
+      log(`Started realtime engine: ${m.display_name}. Play your keyboard.`);
+      $("#latentBody").classList.add("hide"); $("#latentHint").classList.remove("hide");
+      $("#latentHint").textContent="Plain-Aria realtime model running (no sliders).";
+    } else {
+      const r = await jpost("/api/latent/load", {model_key:m.key});
+      const j = await r.json();
+      log(`Loaded VAE: ${m.display_name} (z_dim=${j.z_dim}).`);
+      await buildSliders();
+      $("#latentBody").classList.remove("hide"); $("#latentHint").classList.add("hide");
+    }
+    CURRENT=m;
+  }catch(e){ log("ERROR: "+e.message); }
+};
+
+$("#btnStop").onclick = async ()=>{
+  try{ await jpost("/api/realtime/stop"); log("Stopped realtime engine."); }
+  catch(e){ log("ERROR: "+e.message); }
+};
+
+$("#btnEncode").onclick = async ()=>{
+  try{ const r=await jpost("/api/latent/encode",{seed_midi:$("#seedSel").value});
+    const j=await r.json(); log(`Encoded seed → z (dim ${j.z_dim}).`); }
+  catch(e){ log("ERROR: "+e.message); }
+};
+
+async function generate(useRandom){
+  try{
+    const r = await jpost("/api/latent/generate", {
+      offsets: collectOffsets(), temperature:+$("#temp").value,
+      top_p:+$("#topp").value, use_random_z:!!useRandom });
+    const buf = await r.arrayBuffer();
+    log(`Generated ${buf.byteLength} bytes of MIDI.`);
+    await playMidiBlob(buf);
+  }catch(e){ log("ERROR: "+e.message); }
+}
+$("#btnGen").onclick  = ()=>generate(false);
+$("#btnRand").onclick = ()=>generate(true);
+
+(async ()=>{
+  await initMidi();
+  await loadModels();
+  await loadPorts();
+  await loadSeeds();
+  log("Ready. Pick a model and press Load & Start.");
+})();
+</script>
+</body>
+</html>
