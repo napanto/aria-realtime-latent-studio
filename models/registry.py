@@ -165,8 +165,13 @@ def resolve_asset(rel_or_local: str) -> Path:
     """Resolve a ``tokenizer_config_local`` string to an absolute path.
 
     Accepts paths relative to the repo root (``assets/...`` or ``weights/...``).
+    ``weights/...`` paths honour the ``LATENT_STUDIO_WEIGHTS`` override so the
+    weights dir can live outside the repo (e.g. on a bigger volume).
     """
     p = Path(rel_or_local)
     if p.is_absolute():
         return p
+    parts = p.parts
+    if parts and parts[0] == "weights":
+        return (WEIGHTS_DIR.joinpath(*parts[1:])).resolve()
     return (ASSETS_DIR.parent / rel_or_local).resolve()

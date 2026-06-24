@@ -51,6 +51,7 @@ class AriaVAEBackend(LatentBackend):
         self._probe: Optional[RidgeProbe] = None
         self._gen = None  # the imported src.aria_vae_generate module
         self._av = None   # the imported src.model.aria_vae module
+        self._last_prompt_ids: Optional[np.ndarray] = None
 
     # -- loading -----------------------------------------------------------
     def load(self) -> "AriaVAEBackend":
@@ -94,7 +95,20 @@ class AriaVAEBackend(LatentBackend):
     # -- public API --------------------------------------------------------
     def encode(self, seed_midi_path: str) -> np.ndarray:
         ids = self._tokenize_midi(seed_midi_path)[: self.seq_len]
+        # Remember the prompt window: its head carries the
+        # ("prefix","instrument","piano") + <S> tokens that AbsTokenizer.
+        # detokenize() asserts on. decode() reuses it to seed the continuation.
+        self._last_prompt_ids = ids
         return self._encode_ids(ids)
+
+    def _piano_prefix_ids(self) -> np.ndarray:
+        """A minimal valid prompt head for the random-z (no-seed) case.
+
+        Mirrors the start of ``tok.tokenize``: the piano instrument prefix
+        followed by BOS, so ``detokenize`` finds exactly one instrument.
+        """
+        head = [("prefix", "instrument", "piano"), self._tok.bos_tok]
+        return np.asarray(self._tok.encode(head), dtype=np.int64)
 
     def _tokenize_midi(self, midi_path: str) -> np.ndarray:
         from ariautils.midi import MidiDict
@@ -124,11 +138,13 @@ class AriaVAEBackend(LatentBackend):
             prefix = self._model.injector(z_t)         # (1, K, d_model)
 
         if prompt_ids is None:
-            # Minimal prompt: BOS-equivalent start so the decoder has a context.
-            prompt_ids = np.asarray(
-                [self._tok.tok_to_id[self._tok.bos_tok]], dtype=np.int64
-            )
-        prompt_t = torch.from_numpy(np.asarray(prompt_ids, dtype=np.int64))
+            # Prefer the last encoded seed window (it carries the piano-prefix
+            # head detokenize asserts on); else a minimal valid piano prefix.
+            prompt_ids = getattr(self, "_last_prompt_ids", None)
+            if prompt_ids is None:
+                prompt_ids = self._piano_prefix_ids()
+        prompt_ids = np.asarray(prompt_ids, dtype=np.int64)
+        prompt_t = torch.from_numpy(prompt_ids)
         prompt_t = prompt_t.to(self._device)
 
         grammar = self._gen.GrammarFSM(self._gen.build_grammar(self._tok, self._device))
@@ -186,20 +202,35 @@ class AriaVAEBackend(LatentBackend):
 
         mus, ys = [], []
         for p in seed_midi_paths:
-            ids = self._tokenize_midi(p)
+            try:
+                ids = self._tokenize_midi(p)   # may raise on non-piano/empty MIDI
+            except Exception:
+                continue
             n = len(ids)
             for start in range(0, max(1, n - 32), stride):
                 w = ids[start : start + window]
                 if len(w) < 32:
                     continue
-                mus.append(self._encode_ids(w))
-                w_t = torch.from_numpy(w.astype(np.int64))
-                ys.append(compute_attributes(w_t, self._tok).numpy().reshape(-1))
+                try:
+                    mu = self._encode_ids(w)
+                    w_t = torch.from_numpy(w.astype(np.int64))
+                    y = compute_attributes(w_t, self._tok).numpy().reshape(-1)
+                except Exception:
+                    continue
+                if not (np.isfinite(mu).all() and np.isfinite(y).all()):
+                    continue
+                mus.append(mu)
+                ys.append(y)
                 if len(mus) >= max_windows:
                     break
             if len(mus) >= max_windows:
                 break
 
+        if len(mus) < 16:
+            raise RuntimeError(
+                f"only {len(mus)} usable AriaVAE probe windows; supply more "
+                "piano MIDI seeds."
+            )
         mu_m = np.stack(mus, axis=0)
         y_m = np.stack(ys, axis=0)
         self._probe = fit_ridge_probe(mu_m, y_m, attr_names=ATTRIBUTE_NAMES)

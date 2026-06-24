@@ -26,6 +26,15 @@ from .base import LatentBackend, ensure_reference_repo_on_path, pick_device
 from .probe import RidgeProbe, fit_ridge_probe
 
 
+def _attrs_and_count(midi_path: str):
+    """Return (n_notes, attribute_vector) for a generated MIDI."""
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    n = sum(len(i.notes) for i in pm.instruments if not i.is_drum)
+    return n, attributes_from_midi(pm)
+
+
 class CadenzaVAEBackend(LatentBackend):
     z_dim = 128
     attribute_names = ATTRIBUTE_NAMES
@@ -102,7 +111,7 @@ class CadenzaVAEBackend(LatentBackend):
 
     def encode(self, seed_midi_path: str) -> np.ndarray:
         ids = self._comp_tok.encode_midi(str(seed_midi_path))
-        max_len = int(getattr(self._composer.cfg, "max_seq_len", 192))
+        max_len = int(getattr(self._composer.config, "max_seq_len", 192))
         return self._encode_ids(ids[:max_len])
 
     def decode(self, z: np.ndarray, out_path: str, **sampling) -> str:
@@ -117,7 +126,11 @@ class CadenzaVAEBackend(LatentBackend):
         temperature = float(sampling.get("temperature", 1.0))
         top_k = int(sampling.get("top_k", 0))
         top_p = float(sampling.get("top_p", 1.0))
-        max_steps = int(sampling.get("max_steps", 192))
+        # Cap below the Composer's positional limit. The upstream generate()
+        # RoPE/KV buffer overflows by one exactly at max_seq_len, so we stay a
+        # couple of tokens under it.
+        ceil = int(getattr(self._composer.config, "max_seq_len", 192)) - 4
+        max_steps = min(int(sampling.get("max_steps", ceil)), ceil)
 
         z_t = torch.from_numpy(np.asarray(z, dtype=np.float32)).view(1, -1)
         z_t = z_t.to(self._device)
@@ -174,41 +187,61 @@ class CadenzaVAEBackend(LatentBackend):
         max_windows: int = 200,
         save_to: Optional[str] = None,
         tmp_dir: Optional[str] = None,
+        perturb_sigma: float = 0.8,
+        samples_per_seed: int = 2,
+        min_notes: int = 2,
+        decode_max_steps: Optional[int] = None,
     ) -> RidgeProbe:
         """Fit z->attribute probe for Cadenza.
 
-        We encode each seed window to mu, decode it back through the two-stage
-        pipeline, and measure attributes on the *output* MIDI (tokenizer-free
-        ``attributes_from_midi``). This learns "what direction in z moves this
-        observable attribute of Cadenza's own output" — the right notion for a
-        controllability slider.
+        For each seed we encode to ``mu`` then draw a few latents in its
+        neighbourhood (``z = mu + sigma * eps``) and decode each, measuring
+        attributes on the *output* MIDI (tokenizer-free ``attributes_from_midi``).
+        Sampling around the posterior gives non-degenerate, varied outputs (the
+        bare mean tends to collapse to a sparse skeleton), which is what makes
+        the ridge fit meaningful. This learns "what direction in z moves an
+        observable attribute of Cadenza's own output" — the slider semantics.
         """
         import tempfile
 
-        max_len = int(getattr(self._composer.cfg, "max_seq_len", 192))
+        rng = np.random.default_rng(0)
+        max_len = int(getattr(self._composer.config, "max_seq_len", 192))
         td = Path(tmp_dir or tempfile.mkdtemp(prefix="cadenza_probe_"))
         td.mkdir(parents=True, exist_ok=True)
 
         mus, ys = [], []
+        k = 0
         for i, p in enumerate(seed_midi_paths):
             ids = self._comp_tok.encode_midi(str(p))[:max_len]
             if len(ids) < 16:
                 continue
             mu = self._encode_ids(ids)
-            out = td / f"probe_{i:04d}.mid"
-            try:
-                self.decode(mu, str(out), temperature=1.0, max_steps=max_len)
-                y = attributes_from_midi(str(out))
-            except Exception:
-                continue
-            mus.append(mu)
-            ys.append(y)
-            if len(mus) >= max_windows:
+            for s in range(max(1, samples_per_seed)):
+                eps = rng.standard_normal(mu.shape).astype(np.float32)
+                z = mu if s == 0 else (mu + perturb_sigma * eps)
+                out = td / f"probe_{i:04d}_{s}.mid"
+                dec_kw = {"temperature": 1.0}
+                if decode_max_steps is not None:
+                    dec_kw["max_steps"] = int(decode_max_steps)
+                try:
+                    self.decode(out_path=str(out), z=z, **dec_kw)
+                    n_notes, y = _attrs_and_count(str(out))
+                except Exception:
+                    continue
+                if n_notes < min_notes:
+                    continue
+                mus.append(z)
+                ys.append(y)
+                k += 1
+                if k >= max_windows:
+                    break
+            if k >= max_windows:
                 break
 
         if len(mus) < 16:
             raise RuntimeError(
-                f"only {len(mus)} usable probe windows; supply more seed MIDI."
+                f"only {len(mus)} usable probe windows; supply more/denser seed "
+                "MIDI (or a Performer ckpt so outputs carry velocity/pedal)."
             )
         mu_m = np.stack(mus, axis=0)
         y_m = np.stack(ys, axis=0)

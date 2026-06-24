@@ -32,6 +32,8 @@ def main() -> int:
     ap.add_argument("--seed-dir", required=True)
     ap.add_argument("--performer-ckpt", default=None)
     ap.add_argument("--n-windows", type=int, default=24)
+    ap.add_argument("--probe-max-steps", type=int, default=48,
+                    help="cap Cadenza decode length during probe (CPU speed)")
     args = ap.parse_args()
 
     import numpy as np
@@ -64,7 +66,16 @@ def main() -> int:
     assert np.isfinite(z).all()
     print(f"[smoke] (2) encode -> z shape {z.shape}, |z|={np.linalg.norm(z):.3f}")
 
-    probe = be.build_probe(seeds, max_windows=args.n_windows)
+    if args.model == "cadenza_vae":
+        # CPU decode is slow; keep the probe small + short for a smoke test.
+        probe = be.build_probe(
+            seeds,
+            max_windows=args.n_windows,
+            samples_per_seed=2,
+            decode_max_steps=args.probe_max_steps,
+        )
+    else:
+        probe = be.build_probe(seeds, max_windows=args.n_windows)
     print("[smoke] (3) ridge probe fit; held-out R²:")
     for a in probe.attr_names:
         d = be.direction(a)
