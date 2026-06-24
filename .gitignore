@@ -1,0 +1,29 @@
+# Model weights — never commit (fetched by scripts/download_models.py)
+weights/
+*.safetensors
+*.pt
+*.ckpt
+*.bin
+
+# Generated / runtime artifacts
+*.mid
+!assets/seed_midi/*.mid
+demo.log
+*.log
+runs/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
