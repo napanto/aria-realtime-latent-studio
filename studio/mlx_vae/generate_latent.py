@@ -26,17 +26,23 @@ from grammar import GrammarFSM, build_grammar, sanitize_aria_tokens
 from latent_control import LatentController
 
 
-def sample_min_p(logits: mx.array, p_base: float, temp: float) -> int:
-    """Min-p sampler in logit space (matches demo_mlx.sample_min_p)."""
+def sample_min_p(logits: mx.array, p_base: float, temp: float, top_p: float = 1.0) -> int:
+    """Temperature sampler with an optional min-p floor and/or top-p (nucleus).
+    temp<=0 is greedy; min_p (``p_base``) keeps tokens with prob >= p_base*max;
+    top_p keeps the smallest set whose cumulative prob >= top_p."""
     if temp <= 0.0:
         return int(mx.argmax(logits).item())
     logits = logits / temp
-    if p_base <= 0.0:
-        return int(mx.argmax(logits).item())
-    log_p_max = mx.max(logits, axis=-1, keepdims=True)
-    thresh = mx.log(mx.array(p_base)) + log_p_max
-    masked = mx.where(logits >= thresh, logits, -mx.inf)
-    return int(mx.random.categorical(masked).item())
+    if p_base > 0.0:
+        thresh = mx.log(mx.array(p_base)) + mx.max(logits)
+        logits = mx.where(logits >= thresh, logits, -mx.inf)
+    if 0.0 < top_p < 1.0:
+        sl = logits[mx.argsort(-logits)]                 # descending
+        cum = mx.cumsum(mx.softmax(sl))
+        k = int(mx.sum(cum < top_p).item()) + 1          # include the crossing token
+        thr = float(sl[k - 1].item())
+        logits = mx.where(logits >= thr, logits, -mx.inf)
+    return int(mx.random.categorical(logits).item())
 
 
 def midi_attrs(md) -> dict:
@@ -60,7 +66,7 @@ def midi_attrs(md) -> dict:
     }
 
 
-def generate_one(model, tok, grammar, prompt_ids, n_new, temp, min_p, eos_id, constrained):
+def generate_one(model, tok, grammar, prompt_ids, n_new, temp, min_p, eos_id, constrained, top_p=1.0):
     """KV-cached constrained generation. Returns (full_ids, tokens_per_sec)."""
     P = len(prompt_ids)
     model.setup_stream(max_seq_len=model.model_config.max_seq_len)
@@ -79,7 +85,7 @@ def generate_one(model, tok, grammar, prompt_ids, n_new, temp, min_p, eos_id, co
         lg = last
         if fsm:
             lg = lg + fsm.neg_mask()
-        tid = sample_min_p(lg, min_p, temp)
+        tid = sample_min_p(lg, min_p, temp, top_p)
         out.append(tid)
         if fsm:
             fsm.advance(tid)

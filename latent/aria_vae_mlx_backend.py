@@ -161,7 +161,8 @@ class AriaVAEMLXBackend(LatentBackend):
         from generate_latent import generate_one, sanitize_aria_tokens
 
         temperature = float(sampling.get("temperature", 1.0))
-        min_p = float(sampling.get("min_p", 0.03))
+        min_p = float(sampling.get("min_p", 0.0))
+        top_p = float(sampling.get("top_p", 1.0))
         n_new = int(sampling.get("max_new_tokens", sampling.get("n_new", 384)))
         constrained = bool(sampling.get("constrained", True))
         prompt_ids = sampling.get("prompt_ids")
@@ -187,6 +188,7 @@ class AriaVAEMLXBackend(LatentBackend):
             min_p,
             self._eos_id,
             constrained,
+            top_p=top_p,
         )
         toks = sanitize_aria_tokens(self._tok.decode(full), self._tok)
         md = self._tok.detokenize(toks)

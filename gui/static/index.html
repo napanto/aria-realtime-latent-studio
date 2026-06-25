@@ -94,15 +94,15 @@
 
       <div id="sliders"></div>
 
-      <label>Sampling</label>
+      <label>Sampling <span class="r2" id="sampNote"></span></label>
       <div class="row">
         <span>
-          <span class="r2">temperature</span>
+          <span class="r2">temperature <b id="tempVal">0.95</b></span>
           <input id="temp" type="range" min="0.5" max="1.4" step="0.05" value="0.95">
         </span>
         <span>
-          <span class="r2">top-p</span>
-          <input id="topp" type="range" min="0.5" max="1.0" step="0.02" value="0.9">
+          <span class="r2">top-p <b id="toppVal">0.95</b></span>
+          <input id="topp" type="range" min="0.5" max="1.0" step="0.01" value="0.95">
         </span>
       </div>
 
@@ -158,9 +158,21 @@ async function loadModels(){
 }
 
 function curModel(){ return MODELS.find(m=>m.key===$("#modelSel").value); }
+function syncSampleVals(){
+  $("#tempVal").textContent = (+$("#temp").value).toFixed(2);
+  $("#toppVal").textContent = (+$("#topp").value).toFixed(2);
+}
 function onModelChange(){
   const m = curModel();
   $("#modelNote").textContent = m ? `[${m.backend}] ${m.notes}` : "";
+  // Apply this model's appropriate sampling defaults.
+  const s = (m && m.sampling) || {};
+  if(s.temperature!=null) $("#temp").value = s.temperature;
+  if(s.top_p!=null) $("#topp").value = s.top_p;
+  const usesMinP = m && m.backend==="mlx";   // plain-Aria realtime samples with min_p
+  $("#sampNote").textContent = m
+    ? (usesMinP ? `(temp + min_p ${s.min_p ?? 0.03})` : `(temp + top-p)`) : "";
+  syncSampleVals();
 }
 
 function selectMatch(sel, name){
@@ -267,7 +279,8 @@ $("#btnStart").onclick = async ()=>{
     if(m.backend==="mlx"){
       await jpost("/api/realtime/start", {
         model_key:m.key, midi_out:$("#midiOut").value,
-        midi_in:$("#midiIn").value||null, temperature:+$("#temp").value });
+        midi_in:$("#midiIn").value||null, temperature:+$("#temp").value,
+        min_p:(m.sampling&&m.sampling.min_p!=null)?m.sampling.min_p:0.03 });
       log(`Started realtime engine: ${m.display_name}. Play your keyboard.`);
       $("#latentBody").classList.add("hide"); $("#latentHint").classList.remove("hide");
       $("#latentHint").textContent="Plain-Aria realtime model running (no sliders).";
@@ -308,6 +321,8 @@ async function generate(useRandom){
 }
 $("#btnGen").onclick  = ()=>generate(false);
 $("#btnRand").onclick = ()=>generate(true);
+$("#temp").oninput = syncSampleVals;
+$("#topp").oninput = syncSampleVals;
 $("#btnVOut").onclick = async ()=>{
   const name = $("#vOutName").value.trim(); if(!name) return;
   try{

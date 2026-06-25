@@ -213,6 +213,24 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 }
 
 
+# Per-model sampling defaults (the GUI applies these when a model is selected).
+# Plain-Aria models sample with temperature + min_p (the demo's sampler); the VAE
+# latent paths use temperature + top_p (nucleus). Values are the ones the run
+# scripts / sweeps found good for each.
+MODEL_SAMPLING: dict[str, dict] = {
+    "aria_base":       {"temperature": 1.2, "min_p": 0.035, "top_p": 1.0},
+    "aria_jazz":       {"temperature": 1.1, "min_p": 0.02,  "top_p": 1.0},
+    "aria_vae":        {"temperature": 1.0, "top_p": 0.95,  "min_p": 0.0},
+    "aria_vae_mlx":    {"temperature": 1.0, "top_p": 0.95,  "min_p": 0.0},
+    "cadenza_vae":     {"temperature": 1.0, "top_p": 0.97,  "min_p": 0.0},
+    "cadenza_vae_mlx": {"temperature": 1.0, "top_p": 0.97,  "min_p": 0.0},
+}
+
+
+def get_sampling(key: str) -> dict:
+    return MODEL_SAMPLING.get(key, {"temperature": 1.0, "top_p": 0.95, "min_p": 0.0})
+
+
 def get_spec(key: str) -> ModelSpec:
     if key not in MODEL_REGISTRY:
         raise KeyError(

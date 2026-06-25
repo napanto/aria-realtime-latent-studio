@@ -38,7 +38,9 @@ except ImportError as e:  # pragma: no cover - import-time guard
         "GUI needs fastapi+uvicorn: pip install -r requirements.txt"
     ) from e
 
-from models.registry import MODEL_REGISTRY, Backend, get_spec, resolve_asset
+from models.registry import (
+    MODEL_REGISTRY, Backend, get_spec, get_sampling, resolve_asset,
+)
 from studio import REPO_ROOT, SEED_MIDI_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -114,6 +116,7 @@ def api_models() -> JSONResponse:
                 "downloaded": spec.is_downloaded(),
                 "z_dim": spec.z_dim,
                 "notes": spec.notes,
+                "sampling": get_sampling(key),
             }
         )
     return JSONResponse(out)
