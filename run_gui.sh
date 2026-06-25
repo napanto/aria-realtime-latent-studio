@@ -14,6 +14,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PORT="${PORT:-8000}"
 
+# Ensure Homebrew tools (uv) are on PATH even in non-login shells.
+for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+    [ -d "$d" ] && case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH";; esac
+done
+export PATH
 command -v uv >/dev/null || { echo "uv not found (brew install uv)"; exit 1; }
 
 # 1) venv + deps (one-time; cheap to re-run).
