@@ -49,6 +49,22 @@ class RealtimeConfig:
     midi_control_signal: Optional[int] = None
     midi_reset_control_signal: Optional[int] = None
     back_and_forth: bool = False
+    # Turn-switch timing ("snap" | "freeze" | "catchup"). None keeps the demo
+    # default (catchup), which is best for tight live keyboard turn-taking. For
+    # file-seeded / sparse use, "snap" (insert the elapsed pause as a rest, then
+    # play the continuation forward) streams more reliably.
+    turn_switch_mode: Optional[str] = None
+    # --- AriaVAE latent mode (set latent_dir to turn it on) ---------------
+    # When latent_dir is set, the VAE *decoder* becomes the streamed model:
+    # an 8-token z-prefix occupies KV positions 0..K-1 plus a per-layer
+    # z-residual is added before every block. The demo's prefill/decode_one
+    # branch on the module-level ``LATENT`` so the SAME real-time loop streams
+    # AriaVAE. latent_seed_midi anchors the base z to a style; latent_prior
+    # samples z~N(0,I) instead.
+    latent_dir: Optional[str] = None
+    latent_seed_midi: Optional[str] = None
+    latent_prior: bool = False
+    latent_gain: float = 2.0
 
 
 class RealtimeAriaEngine:
@@ -75,8 +91,41 @@ class RealtimeAriaEngine:
         return self._demo
 
     def load(self):
-        """Load the checkpoint and warm up the MLX compute graphs (blocking)."""
+        """Load the checkpoint and warm up the MLX compute graphs (blocking).
+
+        Two paths:
+          * plain Aria (``latent_dir`` unset): load the demo checkpoint, warm up,
+            fill a zero condition KV slot (EMBEDDING_OFFSET = 1).
+          * AriaVAE (``latent_dir`` set): build the VAE via the demo's
+            ``load_latent`` + ``set_latent_base``; the VAE *decoder* becomes the
+            streamed model and ``demo.LATENT`` makes prefill/decode_one route
+            through the per-layer z-residual + 8-token z-prefix. Mirrors exactly
+            demo_mlx.main()'s ``args.latent_dir`` branch.
+        """
         demo = self._import_demo()
+
+        # The vendored demo reads its tokenizer config from a module-level path
+        # constant. Point it at *this* model's config so aria_base and
+        # aria_jazz (and the AriaVAE demo tokenizer) can each use their own.
+        demo.TOKENIZER_CONFIG_PATH = Path(self.cfg.tokenizer_config)
+        if self.cfg.hardware:
+            demo.set_calibration_settings(self.cfg.hardware)
+        if self.cfg.turn_switch_mode:
+            demo.TURN_SWITCH_MODE = self.cfg.turn_switch_mode
+
+        # Mirror demo_mlx.main()'s arg object for quantize.
+        demo.args = _DemoArgs(self.cfg)
+
+        import mlx.core as mx
+        from ariautils.tokenizer import AbsTokenizer
+
+        if self.cfg.latent_dir:
+            self._load_latent(demo)
+            self._tokenizer = AbsTokenizer(
+                config_path=Path(self.cfg.tokenizer_config)
+            )
+            self._loaded = True
+            return self
 
         if not Path(self.cfg.checkpoint).exists():
             raise FileNotFoundError(
@@ -84,33 +133,63 @@ class RealtimeAriaEngine:
                 "Run scripts/download_models.py first."
             )
 
-        # The vendored demo reads its tokenizer config from a module-level path
-        # constant. Point it at *this* model's config so aria_base and
-        # aria_jazz can each use their own tokenizer.
-        demo.TOKENIZER_CONFIG_PATH = Path(self.cfg.tokenizer_config)
-        if self.cfg.hardware:
-            demo.set_calibration_settings(self.cfg.hardware)
-
-        # Mirror demo_mlx.main()'s arg object for quantize.
-        demo.args = _DemoArgs(self.cfg)
-
         self._model = demo.load_model(checkpoint_path=self.cfg.checkpoint)
         self._model = demo.warmup_model(model=self._model)
 
         # Match main(): with no conditioning embedding we fill a zero condition
         # KV slot so EMBEDDING_OFFSET == 1 (the demo's unconditional path).
-        import mlx.core as mx
-
         self._model.fill_condition_kv(
             mx.zeros((1, self._model.model_config.emb_size), dtype=demo.DTYPE)
         )
         demo.EMBEDDING_OFFSET = 1
 
-        from ariautils.tokenizer import AbsTokenizer
-
         self._tokenizer = AbsTokenizer(config_path=Path(self.cfg.tokenizer_config))
         self._loaded = True
         return self
+
+    def _load_latent(self, demo):
+        """Build the AriaVAE latent and arm the demo's latent path.
+
+        Byte-for-byte mirror of demo_mlx.main()'s ``args.latent_dir`` branch:
+        load_latent -> setup_stream -> set_latent_base (sets EMBEDDING_OFFSET=K
+        and the base z) -> warmup_model -> prefill_prefix (write the z-prefix
+        into KV positions 0..K-1). After this, demo.run() streams AriaVAE because
+        demo.prefill / demo.decode_one branch on demo.LATENT.
+        """
+        from ariautils.tokenizer import AbsTokenizer
+
+        tokenizer = AbsTokenizer(config_path=Path(self.cfg.tokenizer_config))
+        demo.LATENT, demo.LATENT_CTRL = demo.load_latent(
+            self.cfg.latent_dir, tokenizer, self.cfg.quantize, self.cfg.latent_gain
+        )
+        # The GUI drives the latent live over HTTP (/api/realtime/latent), not
+        # via hardware CC sliders, so no SLIDER_MAP is mapped here.
+        demo.SLIDER_MAP = {}
+
+        model = demo.LATENT.decoder
+        model_max = getattr(model.model_config, "max_seq_len", demo.MAX_SEQ_LEN)
+        if demo.MAX_SEQ_LEN > model_max:
+            demo.MAX_SEQ_LEN = model_max
+        demo.LATENT.setup_stream(demo.MAX_SEQ_LEN)
+        demo.set_latent_base(
+            demo.LATENT, demo.LATENT_CTRL, tokenizer,
+            self.cfg.latent_seed_midi, self.cfg.latent_prior,
+        )  # sets demo.EMBEDDING_OFFSET = K
+        model = demo.warmup_model(model=model)
+        demo.LATENT.prefill_prefix()  # write z-prefix into KV positions 0..K-1
+        self._model = model
+
+        # The latent forward (_latent_forward) bypasses Transformer.__call__, so
+        # model.kv_ctx is never initialised and stays None. The demo's debug
+        # logging eagerly evaluates ``tokenizer.decode(model.get_kv_ctx())`` in
+        # recalc_dur_tokens_chunked / decode_first_tokens, which raises on None
+        # and silently kills the generate thread (no streaming). Initialise
+        # kv_ctx exactly as Transformer.__call__ would (all-unk), so get_kv_ctx()
+        # returns [] and the debug path is a harmless no-op. Debug-only state;
+        # the real KV cache lives in the per-layer KVCache objects.
+        import mlx.core as mx
+
+        model.model.kv_ctx = mx.full(model.max_seq_len, 3)
 
     def start(self):
         """Spawn the demo run-loop in a background thread."""
@@ -162,22 +241,105 @@ class RealtimeAriaEngine:
             back_and_forth=cfg.back_and_forth,
         )
 
+    # -- latent (AriaVAE) live control ------------------------------------
+    @property
+    def is_latent(self) -> bool:
+        return bool(self.cfg.latent_dir)
+
+    def set_latent_offsets(self, offsets: dict) -> list:
+        """Move the live latent z by per-attribute deltas (AriaVAE only).
+
+        ``offsets`` maps attribute name -> Δ (raw attribute units). For each we
+        call ``LATENT_CTRL.set_attr_delta(idx, Δ)`` then STAGE the new z via
+        ``LATENT.request_z(LATENT_CTRL.z())`` (numpy only — no MLX on this HTTP
+        thread). The decoder thread materialises prefix+residuals on its next
+        token, so the player hears the change within ~one token and MLX is never
+        driven from two threads at once (which segfaults). Returns the list of
+        applied attribute names.
+        """
+        demo = self._import_demo()
+        if demo.LATENT is None or demo.LATENT_CTRL is None:
+            raise RuntimeError("this engine is not running in AriaVAE latent mode")
+
+        ctrl = demo.LATENT_CTRL
+        applied = []
+        for name, delta in (offsets or {}).items():
+            if name not in ctrl.names:
+                continue
+            ctrl.set_attr_delta(ctrl.attr_index(name), float(delta))
+            applied.append(name)
+        demo.LATENT.request_z(ctrl.z())  # numpy stage; decoder thread applies it
+        return applied
+
+    def latent_attributes(self) -> list:
+        """Slider spec for the running AriaVAE: [{name, label, r2, active}]."""
+        demo = self._import_demo()
+        if demo.LATENT_CTRL is None:
+            return []
+        from latent.attributes import ATTR_LABELS
+
+        ctrl = demo.LATENT_CTRL
+        active = set(ctrl.active)
+        out = []
+        for k, name in enumerate(ctrl.names):
+            r2 = float(ctrl.r2[k])
+            out.append({
+                "name": name,
+                "label": ATTR_LABELS.get(name, name),
+                "r2": round(r2, 3) if r2 == r2 else None,  # NaN -> None
+                "active": k in active,
+            })
+        return out
+
     def trigger_ai_takeover(self):
-        """Push a synthetic control signal so the AI starts generating now."""
-        # The demo's keypress listener treats an empty stdin line as 'go'; from
-        # code we set the control sentinel via the reset machinery. The simplest
-        # robust trigger is the configured MIDI control CC if present.
-        if self._reset_sentinel is None:
-            return
-        # No-op placeholder: real triggering happens via the MIDI control CC or
-        # the keyboard listener inside demo.run. See STATUS.md (GUI transport).
+        """Inject a synthetic takeover control signal so generation starts now.
+
+        Mirrors a foot-controller hand-over: a ``note_on`` (which primes the
+        demo's control listener's ``seen_note_on`` gate) followed by the takeover
+        CC (value 127). Both go to the CONTROL queue only — they are never
+        tokenized as performance input. demo.run()'s ``listen_for_midi_control_
+        signal`` then sets its control sentinel, ending the capture turn and
+        starting generation. Requires the engine to have been started with a
+        concrete ``midi_control_signal`` (the start endpoint defaults it to 102).
+        """
+        if not self.is_running:
+            raise RuntimeError("engine is not running; call start() first")
+        cc = self.cfg.midi_control_signal
+        if cc is None:
+            raise RuntimeError(
+                "no midi_control_signal configured; cannot trigger takeover"
+            )
+        import mido
+
+        self._midi_control_queue.put(
+            mido.Message("note_on", note=60, velocity=64)
+        )
+        self._midi_control_queue.put(
+            mido.Message("control_change", control=int(cc), value=127)
+        )
 
     def stop(self):
-        """Signal the run-loop to exit and join it."""
+        """Signal the run-loop to exit and join it.
+
+        Injects the reset control CC first: ``decode_tokens`` only watches the
+        demo's *control* sentinel (set by the control listener on the reset CC),
+        not ``reset_sentinel``. Without this an in-flight generation keeps
+        streaming and driving MLX after stop(), which then collides with any
+        later MLX op (e.g. switching to Cadenza) and crashes the process. With
+        it, generation halts within ~one token so MLX is quiescent on return.
+        """
+        cc = self.cfg.midi_reset_control_signal
+        if cc is not None and self.is_running:
+            import mido
+
+            for _ in range(3):
+                self._midi_control_queue.put(
+                    mido.Message("control_change", control=int(cc), value=127)
+                )
         if self._reset_sentinel is not None:
             self._reset_sentinel.set()
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=8.0)
         self._thread = None
 
     @property

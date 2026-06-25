@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from aria.model import ModelConfig
 from aria.inference.model_mlx import TransformerLM, apply_rotary_emb_mlx
@@ -149,7 +151,13 @@ class AriaVAEMLX:
 
         # set when z is chosen
         self.prefix = None       # (1,K,d) dtype
-        self.residuals = None    # list[(1,1,d)] dtype
+        self._residuals = None   # list[(1,1,d)] dtype (read via the property)
+        # Live z control: a slider move stages a numpy z here (no MLX); the
+        # decoder thread materialises prefix+residuals lazily on the next
+        # `residuals` access. This keeps ALL MLX work on the single decoder
+        # thread — driving MLX/Metal from two threads at once segfaults.
+        self._pending_z = None
+        self._z_lock = threading.Lock()
 
     # -- loading ----------------------------------------------------------
     @classmethod
@@ -191,12 +199,44 @@ class AriaVAEMLX:
         return self.encoder(ids.astype(mx.int32))
 
     def set_z(self, z: mx.array):
-        """Cache the prefix (1,K,d) and the 16 per-layer residuals for this z."""
+        """Cache the prefix (1,K,d) and the per-layer residuals for this z.
+
+        Drives MLX, so call it only from the thread that owns the decoder (load
+        time, or the streaming thread). For a live update from another thread use
+        :meth:`request_z`.
+        """
+        self._apply_z(z)
+
+    def _apply_z(self, z: mx.array):
         z = z.reshape(1, self.z_dim)
         self.prefix = self.injector(z).astype(self.dtype)
-        self.residuals = [self.z_adapters[i](z).reshape(1, 1, self.d_model).astype(self.dtype)
-                          for i in range(self.n_layers)]
-        mx.eval(self.prefix, *self.residuals)
+        self._residuals = [self.z_adapters[i](z).reshape(1, 1, self.d_model).astype(self.dtype)
+                           for i in range(self.n_layers)]
+        mx.eval(self.prefix, *self._residuals)
+
+    def request_z(self, z_np):
+        """Thread-safe live z update: stage a numpy z (NO MLX work).
+
+        The decoder thread materialises the prefix+residuals on its next
+        ``residuals`` access, so MLX is never driven from two threads at once
+        (which segfaults the process). Safe to call from an HTTP handler while
+        the decoder streams; the change takes effect on the next token.
+        """
+        with self._z_lock:
+            self._pending_z = np.asarray(z_np, dtype=np.float32)
+
+    @property
+    def residuals(self):
+        """Per-layer z-residuals, applying any staged live z first (on THIS
+        thread). Accessed once per layer per token by the decoder, so the lazy
+        re-materialisation runs on the decoder thread, never the HTTP thread."""
+        pending = None
+        with self._z_lock:
+            if self._pending_z is not None:
+                pending, self._pending_z = self._pending_z, None
+        if pending is not None:
+            self._apply_z(mx.array(pending))
+        return self._residuals
 
     def attrs(self, z: mx.array) -> mx.array:
         h = self.attr_head[0](z.reshape(1, self.z_dim))
