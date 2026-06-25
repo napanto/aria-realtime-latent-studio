@@ -75,9 +75,17 @@
       <button id="btnStart">Load &amp; Start</button>
       <button id="btnStop" class="sec">Stop</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnTakeover" class="sec hide">AI takeover (generate now)</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnCadenza" class="hide">Respond (Cadenza)</button>
+    </div>
     <p class="r2" style="font-size:11px;margin-top:8px">
-      Plain-Aria models stream continuations live to the server MIDI output.
-      VAE models generate on demand from the sliders below.
+      Plain-Aria &amp; AriaVAE stream continuations live to the server MIDI
+      output (hit “AI takeover” to hand the model the turn). AriaVAE’s sliders
+      steer the latent z in real time. Cadenza can’t stream note-by-note — it
+      answers your phrase on demand with “Respond (Cadenza)”.
     </p>
   </section>
 
@@ -86,26 +94,36 @@
     <h2>Latent controls (VAE only)</h2>
 
     <div id="latentBody" class="hide">
-      <label>Seed piece</label>
-      <div class="row">
-        <select id="seedSel"></select>
-        <button id="btnEncode" class="sec" style="flex:0 0 110px">Encode → z</button>
+      <div id="onDemandTop">
+        <label>Seed piece</label>
+        <div class="row">
+          <select id="seedSel"></select>
+          <button id="btnEncode" class="sec" style="flex:0 0 110px">Encode → z</button>
+        </div>
       </div>
+
+      <p id="rtLatentHint" class="r2 hide" style="font-size:11px">
+        AriaVAE is streaming — sliders nudge the live latent z (debounced) so the
+        player hears the change in real time. R² shows how reliably z carries
+        that attribute.
+      </p>
 
       <div id="sliders"></div>
 
-      <label>Sampling <span class="r2" id="sampNote"></span></label>
-      <div class="row" id="sampKnobs" style="flex-wrap:wrap"></div>
+      <div id="onDemandBottom">
+        <label>Sampling <span class="r2" id="sampNote"></span></label>
+        <div class="row" id="sampKnobs" style="flex-wrap:wrap"></div>
 
-      <div class="row" style="margin-top:14px">
-        <button id="btnGen">Generate from z + sliders</button>
-        <button id="btnRand" class="sec" style="flex:0 0 130px">Random z</button>
+        <div class="row" style="margin-top:14px">
+          <button id="btnGen">Generate from z + sliders</button>
+          <button id="btnRand" class="sec" style="flex:0 0 130px">Random z</button>
+        </div>
+        <p class="r2" style="font-size:11px;margin-top:6px">
+          z' = z + Σ α·ŵ<sub>attr</sub> — each slider adds its attribute direction
+          (from the ridge probe) before decoding. R² shows how reliably z carries
+          that attribute.
+        </p>
       </div>
-      <p class="r2" style="font-size:11px;margin-top:6px">
-        z' = z + Σ α·ŵ<sub>attr</sub> — each slider adds its attribute direction
-        (from the ridge probe) before decoding. R² shows how reliably z carries
-        that attribute.
-      </p>
     </div>
 
     <p id="latentHint" class="r2">Select a VAE model (AriaVAE / Cadenza) and press
@@ -214,23 +232,41 @@ async function loadSeeds(){
      .map(n=>`<option>${n}</option>`).join("");
 }
 
-async function buildSliders(){
-  const a = await jget("/api/latent/attributes");
-  $("#sliders").innerHTML = a.attributes.map(at=>{
+function renderSliders(attrs, probe_ready, realtime){
+  $("#sliders").innerHTML = (attrs||[]).map(at=>{
     const r2 = at.r2==null ? "" : `R²=${at.r2}`;
     return `<div class="slider" data-attr="${at.name}">
       <div class="top"><span class="lab">${at.label}</span>
         <span class="val">0.0</span></div>
       <input type="range" min="-3" max="3" step="0.1" value="0">
-      <div class="r2">${r2}${a.probe_ready?"":" — probe not built (slider inert)"}</div>
+      <div class="r2">${r2}${(realtime||probe_ready)?"":" — probe not built (slider inert)"}</div>
     </div>`;
   }).join("");
   $("#sliders").querySelectorAll(".slider").forEach(s=>{
     const r=s.querySelector("input"), v=s.querySelector(".val");
-    r.oninput=()=>{ v.textContent=(+r.value).toFixed(1); };
+    r.oninput=()=>{ v.textContent=(+r.value).toFixed(1); if(realtime) scheduleLatentPost(); };
   });
 }
+async function buildSliders(){  // on-demand path (decode from z on Generate)
+  const a = await jget("/api/latent/attributes");
+  renderSliders(a.attributes, a.probe_ready, false);
+}
+async function buildRealtimeLatentSliders(){  // live path (POST per slider move)
+  const a = await jget("/api/realtime/latent_attributes");
+  renderSliders(a.attributes, true, true);
+}
 
+// Debounced live latent POST (~100 ms) so the streaming player hears z changes.
+let _latentTimer=null;
+function scheduleLatentPost(){
+  if(_latentTimer) clearTimeout(_latentTimer);
+  _latentTimer=setTimeout(async ()=>{
+    try{ await jpost("/api/realtime/latent", {offsets: collectOffsetsAll()}); }
+    catch(e){ log("latent: "+e.message); }
+  }, 100);
+}
+
+// On-demand offsets: only the moved sliders (alpha multiples of the direction).
 function collectOffsets(){
   const o={};
   $("#sliders").querySelectorAll(".slider").forEach(s=>{
@@ -238,6 +274,17 @@ function collectOffsets(){
     if(Math.abs(val)>1e-9) o[a]=val;
   });
   return o;
+}
+// Live offsets: ALL sliders (so moving one back to 0 actually resets that attr).
+function collectOffsetsAll(){
+  const o={};
+  $("#sliders").querySelectorAll(".slider").forEach(s=>{ o[s.dataset.attr]=+s.querySelector("input").value; });
+  return o;
+}
+
+function hideTransportExtras(){
+  $("#btnTakeover").classList.add("hide");
+  $("#btnCadenza").classList.add("hide");
 }
 
 // Minimal MIDI-file parser -> schedule note events to WebMIDI output.
@@ -283,26 +330,46 @@ function parseMidi(b){
 }
 
 // --- wiring ---
-$("#modelSel").addEventListener("change", ()=>{ CURRENT=null; });
+$("#modelSel").addEventListener("change", ()=>{ CURRENT=null; hideTransportExtras(); });
 
 $("#btnStart").onclick = async ()=>{
   const m = curModel();
+  hideTransportExtras();
   try{
     if(m.backend==="mlx"){
+      // Plain Aria — streams live; "AI takeover" hands it the turn.
       const samp = collectSampling();
       await jpost("/api/realtime/start", {
         model_key:m.key, midi_out:$("#midiOut").value,
         midi_in:$("#midiIn").value||null,
         temperature: samp.temperature ?? 0.95, min_p: samp.min_p ?? 0.03 });
-      log(`Started realtime engine: ${m.display_name}. Play your keyboard.`);
+      log(`Started realtime engine: ${m.display_name}. Play, then hit “AI takeover”.`);
       $("#latentBody").classList.add("hide"); $("#latentHint").classList.remove("hide");
       $("#latentHint").textContent="Plain-Aria realtime model running (no sliders).";
+      $("#btnTakeover").classList.remove("hide");
+    } else if(m.key==="aria_vae_mlx"){
+      // AriaVAE — same live streaming engine, plus a live-steerable latent z.
+      const samp = collectSampling();
+      await jpost("/api/realtime/start", {
+        model_key:m.key, midi_out:$("#midiOut").value,
+        midi_in:$("#midiIn").value||null,
+        temperature: samp.temperature ?? 1.0, min_p: samp.min_p ?? 0.03 });
+      log(`Started AriaVAE realtime engine: ${m.display_name}. Move the sliders to steer z live.`);
+      await buildRealtimeLatentSliders();
+      $("#latentBody").classList.remove("hide"); $("#latentHint").classList.add("hide");
+      $("#onDemandTop").classList.add("hide"); $("#onDemandBottom").classList.add("hide");
+      $("#rtLatentHint").classList.remove("hide");
+      $("#btnTakeover").classList.remove("hide");
     } else {
+      // Cadenza (mlx) / torch VAEs — on-demand decode from z.
       const r = await jpost("/api/latent/load", {model_key:m.key});
       const j = await r.json();
       log(`Loaded VAE: ${m.display_name} (z_dim=${j.z_dim}).`);
       await buildSliders();
       $("#latentBody").classList.remove("hide"); $("#latentHint").classList.add("hide");
+      $("#onDemandTop").classList.remove("hide"); $("#onDemandBottom").classList.remove("hide");
+      $("#rtLatentHint").classList.add("hide");
+      if(m.key==="cadenza_vae_mlx") $("#btnCadenza").classList.remove("hide");
     }
     CURRENT=m;
   }catch(e){ log("ERROR: "+e.message); }
@@ -311,6 +378,28 @@ $("#btnStart").onclick = async ()=>{
 $("#btnStop").onclick = async ()=>{
   try{ await jpost("/api/realtime/stop"); log("Stopped realtime engine."); }
   catch(e){ log("ERROR: "+e.message); }
+  hideTransportExtras();
+};
+
+$("#btnTakeover").onclick = async ()=>{
+  try{ await jpost("/api/realtime/takeover"); log("AI takeover — the model has the turn."); }
+  catch(e){ log("ERROR: "+e.message); }
+};
+
+$("#btnCadenza").onclick = async ()=>{
+  try{
+    const body = Object.assign(
+      { offsets: collectOffsets(), seed_midi: $("#seedSel").value || null },
+      collectSampling());
+    if($("#playVirt").checked && $("#vOutName").value.trim())
+      body.output_port = $("#vOutName").value.trim();
+    log("Cadenza is responding (encode → Composer → Performer fill)…");
+    const r = await jpost("/api/realtime/cadenza_respond", body);
+    const buf = await r.arrayBuffer();
+    log(`Cadenza responded with ${buf.byteLength} bytes of MIDI.`
+        + (body.output_port? ` — playing through '${body.output_port}'.` : ""));
+    await playMidiBlob(buf);
+  }catch(e){ log("ERROR: "+e.message); }
 };
 
 $("#btnEncode").onclick = async ()=>{
