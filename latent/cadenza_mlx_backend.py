@@ -125,8 +125,11 @@ class CadenzaVAEMLXBackend(LatentBackend):
         top_p = float(sampling.get("top_p", 1.0))
         seed = int(sampling.get("seed", 0))
 
+        # Composer.generate expects a batched latent (1, z_dim); the LatentBackend
+        # contract hands us z as (z_dim,), so add the batch axis.
+        z_b = np.asarray(z, np.float32).reshape(1, -1)
         gen = self._composer.generate(
-            mx.array(np.asarray(z, np.float32)), max_steps=self.max_generate_steps,
+            mx.array(z_b), max_steps=self.max_generate_steps,
             temperature=temperature, top_k=top_k, top_p=top_p, key=mx.random.key(seed))
         mx.eval(gen)
         gen_ids = np.array(gen[0]).astype(np.int32)
