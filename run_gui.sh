@@ -16,10 +16,12 @@ PORT="${PORT:-8000}"
 
 command -v uv >/dev/null || { echo "uv not found (brew install uv)"; exit 1; }
 
-# 1) venv + deps (one-time; cheap to re-run)
-if [ ! -d .venv ]; then
-    echo "[gui] creating venv + installing deps (one-time; pulls torch/mlx/aria)…"
-    uv venv
+# 1) venv + deps (one-time; cheap to re-run).
+# Pin Python 3.13 — mlx ships wheels only up to cp313 (no 3.14 yet).
+PYVER="${PYVER:-3.13}"
+if [ ! -x .venv/bin/python ]; then
+    echo "[gui] creating venv (python $PYVER) + installing deps (one-time; pulls torch/mlx/aria)…"
+    uv venv --python "$PYVER"
 fi
 uv pip install -q -e ".[mlx]" miditok symusic pretty_midi
 
