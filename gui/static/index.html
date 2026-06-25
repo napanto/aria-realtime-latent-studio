@@ -63,6 +63,13 @@
     <label>Browser playback output (WebMIDI)</label>
     <select id="webOut"></select>
 
+    <label>Virtual output (server-created — connect Pianoteq/DAW to it)</label>
+    <div class="row">
+      <input type="text" id="vOutName" value="Aria Studio" />
+      <button id="btnVOut" class="sec" style="width:auto">Create</button>
+    </div>
+    <label style="font-weight:400"><input type="checkbox" id="playVirt" style="width:auto;display:inline" /> play generated MIDI through it</label>
+
     <h2 style="margin-top:18px">Transport</h2>
     <div class="row">
       <button id="btnStart">Load &amp; Start</button>
@@ -288,16 +295,28 @@ $("#btnEncode").onclick = async ()=>{
 
 async function generate(useRandom){
   try{
-    const r = await jpost("/api/latent/generate", {
-      offsets: collectOffsets(), temperature:+$("#temp").value,
-      top_p:+$("#topp").value, use_random_z:!!useRandom });
+    const body = { offsets: collectOffsets(), temperature:+$("#temp").value,
+      top_p:+$("#topp").value, use_random_z:!!useRandom };
+    if($("#playVirt").checked && $("#vOutName").value.trim())
+      body.output_port = $("#vOutName").value.trim();
+    const r = await jpost("/api/latent/generate", body);
     const buf = await r.arrayBuffer();
-    log(`Generated ${buf.byteLength} bytes of MIDI.`);
+    log(`Generated ${buf.byteLength} bytes of MIDI.`
+        + (body.output_port? ` — playing through '${body.output_port}'.` : ""));
     await playMidiBlob(buf);
   }catch(e){ log("ERROR: "+e.message); }
 }
 $("#btnGen").onclick  = ()=>generate(false);
 $("#btnRand").onclick = ()=>generate(true);
+$("#btnVOut").onclick = async ()=>{
+  const name = $("#vOutName").value.trim(); if(!name) return;
+  try{
+    await jpost("/api/midi/create_virtual_output", {name});
+    $("#playVirt").checked = true;
+    log(`Virtual output '${name}' created — connect Pianoteq/your DAW to it; `
+        + `generations will play through it.`);
+  }catch(e){ log("ERROR: "+e.message); }
+};
 
 (async ()=>{
   await initMidi();

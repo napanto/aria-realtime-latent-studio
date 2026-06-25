@@ -53,6 +53,7 @@ _STATE: dict[str, object] = {
     "latent": None,      # LatentBackend
     "latent_key": None,  # which VAE is loaded
     "z": None,           # current base latent (list[float])
+    "virtual_outputs": {},  # name -> open mido virtual output port (server-owned)
 }
 
 
@@ -80,6 +81,11 @@ class LatentGenerate(BaseModel):
     temperature: float = 0.95
     top_p: float = 0.9
     use_random_z: bool = False
+    output_port: Optional[str] = None  # if set, also play the result out this port
+
+
+class VirtualOutput(BaseModel):
+    name: str
 
 
 # ---- static / index --------------------------------------------------------
@@ -139,6 +145,69 @@ def api_midi_config() -> JSONResponse:
         return JSONResponse(json.loads(p.read_text()))
     except Exception as e:
         return JSONResponse({"error": str(e)})
+
+
+# ---- virtual MIDI outputs (server-created) ---------------------------------
+def _play_file_through(midi_path: str, port_name: str) -> None:
+    """Play a .mid file out a port (a server-owned virtual port if known, else a
+    real port opened by name) on a background thread, with the file's timing."""
+    import threading
+    import mido
+
+    def _run():
+        vo = _STATE["virtual_outputs"]  # type: ignore[assignment]
+        owned = port_name in vo
+        port = vo[port_name] if owned else mido.open_output(port_name)
+        try:
+            for msg in mido.MidiFile(midi_path).play():
+                port.send(msg)
+        except Exception:
+            pass
+        finally:
+            if not owned:
+                try:
+                    port.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@app.post("/api/midi/create_virtual_output")
+def api_create_virtual_output(req: VirtualOutput) -> JSONResponse:
+    """Create a persistent virtual MIDI output port other apps (Pianoteq, a DAW)
+    can receive from. Held open for the server's lifetime; the studio sends
+    generated/realtime MIDI through it."""
+    import mido
+
+    vo = _STATE["virtual_outputs"]  # type: ignore[assignment]
+    if req.name in vo:
+        return JSONResponse({"ok": True, "name": req.name, "already": True,
+                             "virtual_outputs": list(vo)})
+    try:
+        vo[req.name] = mido.open_output(req.name, virtual=True)
+    except Exception as e:  # backend without virtual-port support
+        raise HTTPException(
+            400, f"could not create virtual output '{req.name}': {e} "
+                 "(needs the python-rtmidi backend; macOS/Linux only)")
+    return JSONResponse({"ok": True, "name": req.name, "virtual_outputs": list(vo)})
+
+
+@app.post("/api/midi/close_virtual_output")
+def api_close_virtual_output(req: VirtualOutput) -> JSONResponse:
+    vo = _STATE["virtual_outputs"]  # type: ignore[assignment]
+    port = vo.pop(req.name, None)
+    if port is not None:
+        try:
+            port.close()
+        except Exception:
+            pass
+    return JSONResponse({"ok": True, "virtual_outputs": list(vo)})
+
+
+@app.get("/api/midi/virtual_outputs")
+def api_virtual_outputs() -> JSONResponse:
+    return JSONResponse({"virtual_outputs": list(_STATE["virtual_outputs"])})  # type: ignore[arg-type]
 
 
 @app.get("/api/seed_midi")
@@ -295,6 +364,9 @@ def api_latent_generate(req: LatentGenerate) -> FileResponse:
         temperature=req.temperature,
         top_p=req.top_p,
     )
+    # Optionally also play it out a (virtual or real) server-side MIDI port.
+    if req.output_port:
+        _play_file_through(str(out), req.output_port)
     return FileResponse(str(out), media_type="audio/midi", filename=out.name)
 
 
