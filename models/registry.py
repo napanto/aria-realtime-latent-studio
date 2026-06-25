@@ -159,7 +159,10 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         display_name="AriaVAE (latent, real-time MLX)",
         backend=Backend.MLX_VAE,
         z_dim=128,
-        tokenizer_config_local="weights/aria_jazz/tokenizer-config.json",
+        # Vocab-2675 demo tokenizer (vendored) — same one the MLX AriaVAE was
+        # parity-checked with; avoids pulling the 2.45 GB jazz model just for a
+        # tokenizer config.
+        tokenizer_config_local="assets/demo-tokenizer-config.json",
         files=(
             HFFile(_VAE_DATA_REPO, "dataset",
                    "vae_campaign/ariavae_mlx/aria_vae_decoder.safetensors",
