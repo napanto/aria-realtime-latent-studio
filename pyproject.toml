@@ -7,7 +7,7 @@ name = "aria-realtime-latent-studio"
 version = "0.1.0"
 description = "macOS/Apple-Silicon real-time piano continuation app with 4 models and real-time VAE latent manipulation"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "Antonio Napolitano", email = "antonio@napolita.no" }]
 dependencies = [

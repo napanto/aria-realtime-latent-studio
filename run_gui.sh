@@ -23,7 +23,11 @@ if [ ! -x .venv/bin/python ]; then
     echo "[gui] creating venv (python $PYVER) + installing deps (one-time; pulls torch/mlx/aria)…"
     uv venv --python "$PYVER"
 fi
-uv pip install -q -e ".[mlx]" miditok symusic pretty_midi
+# Install only if the venv isn't already complete (skips re-resolution on relaunch).
+if ! .venv/bin/python -c "import fastapi, uvicorn, mlx.core, aria, ariautils, miditok, symusic" 2>/dev/null; then
+    echo "[gui] installing deps…"
+    uv pip install -e ".[mlx]" miditok symusic pretty_midi
+fi
 
 # 2) weights: reuse the sibling latent-studio weights if present, else download
 SIB="$HOME/aria-realtime-latent-studio/weights"
