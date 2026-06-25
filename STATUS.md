@@ -1,5 +1,28 @@
 # STATUS — honest wiring report
 
+> **UPDATE 2026-06-25 — MLX latent engine landed + verified on a real M1.**
+> The `mlx-latent-engine` branch adds a parity-checked MLX latent path and closes
+> three of the TODOs below. Verified on a MacBook Air M1/8 GB (host `hermes`):
+> - **#6 (real-time MLX latent)** ✅ `latent/aria_vae_mlx_backend.py` — the z-prefix
+>   (8 soft tokens) is prefilled into the KV cache + a per-layer z-residual is added
+>   each step on the frozen jazz Aria MLX decoder. MLX-vs-torch parity: μ max|Δ|
+>   2.4e-7, decode logits **100 % argmax**; **52 tok/s / 19 ms/token** int8. No more
+>   torch full-reeval.
+> - **#5 (Cadenza Performer)** ✅ the Performer was **recreated** (PiJAMA-only,
+>   val ppl 37.1, `vae_campaign/A05_kongFT/performer_recreated/`) and converted to
+>   MLX; `latent/cadenza_mlx_backend.py` runs the full two-stage render (Composer
+>   parity 100 %, Performer fill 100 %; latent control note_density **+0.94**).
+> - **#7 (probe quality)** ✅ both probes fit on **320** PiJAMA windows (mean R²
+>   ~0.84–0.85), shipped as `latent_directions*.npz` in the MLX weights dirs.
+>
+> New registry keys `aria_vae_mlx` / `cadenza_vae_mlx` (`Backend.MLX_VAE`) select
+> these; the torch/MPS backends remain as the cross-platform fallback. The engine
+> modules are vendored under `studio/mlx_vae/` (byte-identical to the parity-checked
+> originals). Remaining open items below: GUI takeover hook (#3), MPS dtype pass
+> (#4), seed library (#8).
+
+
+
 **This app was built and CPU-smoke-tested on Linux. It has NOT been run on
 macOS / Apple Silicon.** The real-time MLX path and the MPS path are written
 against the proven upstream code + our real checkpoints, but the end-to-end

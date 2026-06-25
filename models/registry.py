@@ -20,6 +20,7 @@ class Backend(str, enum.Enum):
 
     MLX = "mlx"           # plain Aria, real-time MLX demo engine
     TORCH_VAE = "torch"   # AriaVAE / Cadenza, PyTorch (MPS/CPU) latent engine
+    MLX_VAE = "mlx_vae"   # AriaVAE / Cadenza, parity-checked MLX latent engine
 
 
 @dataclass(frozen=True)
@@ -146,9 +147,65 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         extra={
             "performer_ckpt_hint": (
-                "vae_campaign/A05_*/performer*/best.pt (confirm exact path)"
+                "vae_campaign/A05_kongFT/performer_recreated/best.pt"
             ),
         },
+    ),
+    # (e) AriaVAE — real-time MLX latent engine (parity-checked on M1).
+    # Same latent as aria_vae, but the z-prefix + per-layer z-residual ride the
+    # KV-cached MLX decoder => ~52 tok/s instead of torch full-reeval (TODO #6).
+    "aria_vae_mlx": ModelSpec(
+        key="aria_vae_mlx",
+        display_name="AriaVAE (latent, real-time MLX)",
+        backend=Backend.MLX_VAE,
+        z_dim=128,
+        tokenizer_config_local="weights/aria_jazz/tokenizer-config.json",
+        files=(
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/ariavae_mlx/aria_vae_decoder.safetensors",
+                   "aria_vae_decoder.safetensors"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/ariavae_mlx/aria_vae_latent.safetensors",
+                   "aria_vae_latent.safetensors"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/ariavae_mlx/aria_vae_config.json",
+                   "aria_vae_config.json"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/ariavae_mlx/latent_directions.npz",
+                   "latent_directions.npz"),
+        ),
+        notes=(
+            "Parity-checked MLX AriaVAE: 8 soft z-prefix tokens prefilled into "
+            "the KV cache + per-layer z-residual on the frozen jazz Aria decoder. "
+            "~52 tok/s / 19 ms/token (int8, M1). Probe fit on 320 PiJAMA windows."
+        ),
+    ),
+    # (f) Cadenza — MLX two-stage (Composer + recreated Performer).
+    "cadenza_vae_mlx": ModelSpec(
+        key="cadenza_vae_mlx",
+        display_name="Cadenza VAE (latent, MLX 2-stage)",
+        backend=Backend.MLX_VAE,
+        z_dim=128,
+        files=(
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/cadenza_mlx/cadenza_composer.safetensors",
+                   "cadenza_composer.safetensors"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/cadenza_mlx/cadenza_performer.safetensors",
+                   "cadenza_performer.safetensors"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/cadenza_mlx/cadenza_config.json",
+                   "cadenza_config.json"),
+            HFFile(_VAE_DATA_REPO, "dataset",
+                   "vae_campaign/cadenza_mlx/latent_directions_cadenza.npz",
+                   "latent_directions_cadenza.npz"),
+        ),
+        notes=(
+            "MLX Composer + the RECREATED Performer "
+            "(vae_campaign/A05_kongFT/performer_recreated, val ppl 37.1) baked "
+            "into cadenza_performer.safetensors. Two-stage render unblocked "
+            "(TODO #5); latent control note_density +0.94."
+        ),
     ),
 }
 

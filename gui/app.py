@@ -176,7 +176,7 @@ def api_realtime_stop() -> JSONResponse:
 @app.post("/api/latent/load")
 def api_latent_load(req: LatentLoad) -> JSONResponse:
     spec = get_spec(req.model_key)
-    if spec.backend is not Backend.TORCH_VAE:
+    if spec.backend not in (Backend.TORCH_VAE, Backend.MLX_VAE):
         raise HTTPException(400, f"{req.model_key} is not a VAE latent model")
     if not spec.is_downloaded():
         raise HTTPException(409, f"{req.model_key} weights missing; download first")
@@ -199,6 +199,20 @@ def api_latent_load(req: LatentLoad) -> JSONResponse:
             probe_path=req.probe_path
             or str(spec.weights_subdir / "probe.npz"),
         )
+    elif req.model_key == "aria_vae_mlx":
+        # Real-time MLX latent path (Apple Silicon). Probe directions ship in
+        # the weights dir (latent_directions.npz); no separate probe build.
+        from latent.aria_vae_mlx_backend import AriaVAEMLXBackend
+
+        backend = AriaVAEMLXBackend(
+            weights_dir=str(spec.weights_subdir),
+            tokenizer_config=str(resolve_asset(spec.tokenizer_config_local)),
+            quantize=bool(getattr(req, "quantize", False)),
+        )
+    elif req.model_key == "cadenza_vae_mlx":
+        from latent.cadenza_mlx_backend import CadenzaVAEMLXBackend
+
+        backend = CadenzaVAEMLXBackend(weights_dir=str(spec.weights_subdir))
     else:
         raise HTTPException(400, f"unknown VAE key {req.model_key}")
 
