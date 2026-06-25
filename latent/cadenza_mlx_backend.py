@@ -29,6 +29,7 @@ from typing import Optional
 
 import numpy as np
 
+from .aria_vae_mlx_backend import _ProbeShim
 from .attributes import ATTRIBUTE_NAMES
 from .base import LatentBackend
 
@@ -90,6 +91,7 @@ class CadenzaVAEMLXBackend(LatentBackend):
         self._tok = None
         self._perf_id_set = None
         self._ctrl = None
+        self._probe = None
 
     def load(self) -> "CadenzaVAEMLXBackend":
         _ensure_engine_on_path()
@@ -106,6 +108,7 @@ class CadenzaVAEMLXBackend(LatentBackend):
         self._perf_id_set = set(self._tok.token_ids_by_prefix(_PERFORMANCE_PREFIXES))
         if Path(self.directions_path).exists():
             self._ctrl = LatentController(self.directions_path, gain_sigma=self.gain_sigma)
+            self._probe = _ProbeShim(self._ctrl.names, self._ctrl.r2)
         return self
 
     def encode(self, seed_midi_path: str) -> np.ndarray:

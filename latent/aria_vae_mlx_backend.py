@@ -37,6 +37,16 @@ from .attributes import ATTRIBUTE_NAMES
 from .base import LatentBackend
 
 
+class _ProbeShim:
+    """Minimal probe view the GUI reads (``backend._probe.r2`` dict +
+    ``probe_ready``). The MLX backends keep directions in
+    ``latent_directions*.npz``; this exposes their per-attribute R²."""
+
+    def __init__(self, names, r2):
+        self.r2 = {str(n): (float(v) if np.isfinite(v) else 0.0)
+                   for n, v in zip(names, np.asarray(r2))}
+
+
 def _ensure_engine_on_path() -> Path:
     """Make the vendored ``studio/mlx_vae`` engine importable (flat imports).
 
@@ -101,6 +111,7 @@ class AriaVAEMLXBackend(LatentBackend):
         self._tok = None            # ariautils AbsTokenizer
         self._grammar = None        # build_grammar(tok) dict
         self._ctrl = None           # LatentController (probe directions)
+        self._probe = None          # _ProbeShim (GUI R² view)
         self._eos_id = None
         self._last_prompt_ids: Optional[np.ndarray] = None
         self._mx = None             # mlx.core handle (set in load)
@@ -129,6 +140,7 @@ class AriaVAEMLXBackend(LatentBackend):
             self._ctrl = LatentController(
                 self.directions_path, gain_sigma=self.gain_sigma
             )
+            self._probe = _ProbeShim(self._ctrl.names, self._ctrl.r2)
         return self
 
     # -- contract ------------------------------------------------------------
