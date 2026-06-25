@@ -1,0 +1,10 @@
+{
+  "midi_in": "HDSPe RayDAT (23136176) Port 1",
+  "midi_out": "Aria",
+  "control_midi_in": null,
+  "control_cc": 102,
+  "reset_cc": 103,
+  "turn_switch_mode": "catchup",
+  "hardware_calibration": "assets/hardware/c4dm-disklavier.json",
+  "notes": "Default MIDI device setup for the host rig: a RayDAT keyboard (merged with an MC8 footswitch) into Pianoteq, with the model output on the virtual 'Aria' port. control_cc toggles context-fill <-> generation; reset_cc starts a fresh piece (both ignored by Pianoteq, in the 102-119 'undefined' range). The GUI pre-selects midi_in/midi_out from this file; override per-run via the run-script env vars (MIDI_IN/MIDI_OUT/CONTROL_DEVICE/CONTROL_CC/RESET_CC) or by picking different devices in the browser."
+}

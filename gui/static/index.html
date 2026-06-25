@@ -121,7 +121,7 @@
 <script>
 const $ = s => document.querySelector(s);
 const log = m => { const l=$("#log"); l.textContent += m+"\n"; l.scrollTop=l.scrollHeight; };
-let MODELS = [], CURRENT = null, WEBMIDI = null, WEBOUT = null;
+let MODELS = [], CURRENT = null, WEBMIDI = null, WEBOUT = null, MIDI_CFG = {};
 
 async function jget(u){ const r=await fetch(u); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 async function jpost(u,b){ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
@@ -156,11 +156,25 @@ function onModelChange(){
   $("#modelNote").textContent = m ? `[${m.backend}] ${m.notes}` : "";
 }
 
+function selectMatch(sel, name){
+  if(!name) return;
+  const opts=[...sel.options];
+  const o = opts.find(o=>o.value===name)
+        || opts.find(o=>o.value && o.value.includes(name))
+        || opts.find(o=>o.value && name.includes(o.value));
+  if(o) sel.value=o.value;
+}
 async function loadPorts(){
   const p = await jget("/api/midi_ports");
   $("#midiOut").innerHTML = (p.outputs||[]).map(n=>`<option>${n}</option>`).join("")||`<option value="">(none)</option>`;
   $("#midiIn").innerHTML = `<option value="">(none / control via keyboard)</option>`+
      (p.inputs||[]).map(n=>`<option>${n}</option>`).join("");
+  // Pre-select the saved MIDI devices config (config/midi_devices.json).
+  try{
+    MIDI_CFG = await jget("/api/midi_config") || {};
+    selectMatch($("#midiOut"), MIDI_CFG.midi_out);
+    selectMatch($("#midiIn"),  MIDI_CFG.midi_in);
+  }catch(e){ MIDI_CFG = {}; }
 }
 
 async function loadSeeds(){

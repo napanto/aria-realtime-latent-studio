@@ -125,6 +125,22 @@ def api_midi_ports() -> JSONResponse:
         return JSONResponse({"inputs": [], "outputs": [], "error": str(e)})
 
 
+@app.get("/api/midi_config")
+def api_midi_config() -> JSONResponse:
+    """The saved MIDI devices config (config/midi_devices.json): default
+    input/output port names + control/reset CCs for the host rig. The GUI
+    pre-selects the device dropdowns from this; empty {} if absent."""
+    import json
+
+    p = REPO_ROOT / "config" / "midi_devices.json"
+    if not p.exists():
+        return JSONResponse({})
+    try:
+        return JSONResponse(json.loads(p.read_text()))
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
+
 @app.get("/api/seed_midi")
 def api_seed_midi() -> JSONResponse:
     files = []
