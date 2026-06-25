@@ -26,6 +26,15 @@ from aria.config import load_model_config
 from aria.run import _get_embedding
 
 EMBEDDING_OFFSET: int = 0
+
+# --- AriaVAE latent control (set when --latent_dir is given) ----------------
+# LATENT is an AriaVAEMLX wrapper whose .decoder IS the model; when set, prefill/
+# decode_one route through a per-layer z-residual forward and an 8-token z-prefix
+# occupies KV positions 0..K-1 (EMBEDDING_OFFSET = K). LATENT_CTRL maps slider
+# CCs -> calibrated z moves. Both None for the plain (non-latent) models.
+LATENT = None
+LATENT_CTRL = None
+SLIDER_MAP = {}   # CC number -> attribute index (filled from --latent_slider_cc)
 DTYPE = mx.bfloat16
 MAX_SEQ_LEN: int = 4096
 KV_CHUNK_SIZE: int = 256
@@ -38,6 +47,29 @@ BEAM_WIDTH: int = 3
 TIME_TOK_WEIGHTING: int = -5
 FIRST_ONSET_BUFFER_MS: int = -150
 MAX_STREAM_DELAY_MS: int = 50
+
+# Turn-switch timing (when you hand over with the takeover CC). Three modes:
+#   "snap"    - original: the model jumps its clock to wall-clock, so the elapsed
+#               real time (your pause + prefill) becomes a rest before its first
+#               note, which lands off your rhythmic grid.
+#   "freeze"  - the clock is frozen at takeover: the model continues on-grid from
+#               just after your last note, its whole continuation shifted later
+#               by ~TURN_FREEZE_LATENCY_MS. No rest, but its phase restarts at
+#               the handover.
+#   "catchup" - the model continues with no rest AND generates through the
+#               switching pause, DISCARDING the notes that fall in the past, so
+#               its first audible note lands on your ORIGINAL tempo grid at
+#               wall-clock now (phase-locked to your playing). Costs a little
+#               extra generation to fast-forward through the discarded notes.
+# Applies to turn-taking only (duet manages its own timing).
+TURN_SWITCH_MODE: str = "catchup"
+TURN_FREEZE_LATENCY_MS: int = 400  # used by "freeze" only
+
+# Duet mode: after a burst, hold the capture window open until the model's
+# look-ahead notes have played (+buffer), capped so a far-ahead burst can't
+# stall the loop.
+DUET_CATCHUP_BUFFER_MS: int = 50
+DUET_MAX_CATCHUP_MS: int = 4000
 
 MIN_NOTE_DELTA_MS: int = 0
 MIN_PEDAL_DELTA_MS: int = 0
@@ -52,6 +84,38 @@ TOKENIZER_CONFIG_PATH = (
     .parent.resolve()
     .joinpath("demo-tokenizer-config.json")
 )
+
+
+_persistent_virtual_ports: dict = {}
+
+
+class _KeepAlive:
+    """Context-manager wrapper that exposes a persistent port to a `with`
+    block without closing it on exit, so a virtual port stays visible to
+    other apps (e.g. Pianoteq) for the whole session rather than only while
+    a `with mido.open_output(...)` block is active."""
+
+    def __init__(self, port):
+        self._port = port
+
+    def __enter__(self):
+        return self._port
+
+    def __exit__(self, *exc):
+        return False  # keep the port open
+
+
+def open_output(name: str):
+    """Open an existing MIDI output port by name, or create it as a virtual
+    port if no hardware/IAC port of that name exists. Lets you route the
+    model's output straight into a softsynth (e.g. Pianoteq) without setting
+    up an IAC bus in Audio MIDI Setup. Virtual ports are created once and kept
+    open for the lifetime of the process so they remain visible between turns."""
+    if name in mido.get_output_names():
+        return mido.open_output(name)
+    if name not in _persistent_virtual_ports:
+        _persistent_virtual_ports[name] = mido.open_output(name, virtual=True)
+    return _KeepAlive(_persistent_virtual_ports[name])
 file_handler = logging.FileHandler("./demo.log", mode="w")
 file_handler.setLevel(logging.DEBUG)
 
@@ -91,6 +155,13 @@ def parse_args():
     argp = argparse.ArgumentParser()
     argp.add_argument("--checkpoint", help="path to model checkpoint")
     argp.add_argument("--midi_in", required=False, help="MIDI input port")
+    argp.add_argument(
+        "--control_midi_in",
+        required=False,
+        help="Separate MIDI input port for control signals only (e.g. a "
+        "Morningstar MC8 foot controller). Messages from this port are routed "
+        "to the control queue but never tokenized as performance input.",
+    )
     argp.add_argument("--midi_out", required=True, help="MIDI output port")
     argp.add_argument(
         "--midi_through",
@@ -138,6 +209,52 @@ def parse_args():
         action="store_true",
     )
     argp.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=8192,
+        help="Model context window in tokens (default 8192, the model's trained "
+        "max). A single continuous generation ends when it fills this. Larger = "
+        "longer before it stops, but more KV-cache memory; lower it if the 8GB "
+        "machine runs out of memory.",
+    )
+    argp.add_argument(
+        "--turn_switch_mode",
+        choices=["snap", "freeze", "catchup"],
+        default="catchup",
+        help="Turn-switch timing (turn-taking only): 'snap' inserts the elapsed "
+        "pause as a rest (first note off-grid); 'freeze' continues on-grid from "
+        "your last note, shifted later by --turn_freeze_latency_ms; 'catchup' "
+        "(default) continues with no rest and discards the notes that fall in "
+        "the switching pause so it joins on your original tempo grid.",
+    )
+    argp.add_argument(
+        "--turn_freeze_latency_ms",
+        type=int,
+        default=400,
+        help="Latency (ms) the 'freeze' turn-switch mode shifts the model's "
+        "continuation by (default 400). Ignored by other modes.",
+    )
+    argp.add_argument(
+        "--duet",
+        action="store_true",
+        help="Experimental: play together with the model in a tight interleave "
+        "loop (no turn hand-off). Both your notes and the model's accumulate in "
+        "the shared context.",
+    )
+    argp.add_argument(
+        "--duet_listen_ms",
+        type=int,
+        default=250,
+        help="Duet mode: length of each capture window in ms (default 250).",
+    )
+    argp.add_argument(
+        "--duet_play_ms",
+        type=int,
+        default=500,
+        help="Duet mode: ms of token generation per burst, on top of the "
+        "~0.85s prefill floor on an M1 (default 500).",
+    )
+    argp.add_argument(
         "--quantize",
         help="apply model quantize",
         action="store_true",
@@ -172,6 +289,31 @@ def parse_args():
         help="playback file at midi_path through output_port",
         required=False,
     )
+    # --- AriaVAE latent control ---
+    argp.add_argument(
+        "--latent_dir", required=False,
+        help="dir with aria_vae_{decoder,latent}.safetensors + config + "
+             "latent_directions.npz; turns the AriaVAE latent on (the VAE "
+             "decoder becomes the model).",
+    )
+    argp.add_argument(
+        "--latent_seed_midi", required=False,
+        help="MIDI whose encoding sets the base latent z (style anchor). "
+             "If omitted (or --latent_prior), z is sampled from the prior.",
+    )
+    argp.add_argument(
+        "--latent_prior", action="store_true",
+        help="sample the base z from N(0,I) instead of encoding a seed",
+    )
+    argp.add_argument(
+        "--latent_gain", type=float, default=2.0,
+        help="slider full-scale = gain*sigma of the attribute (default 2.0)",
+    )
+    argp.add_argument(
+        "--latent_slider_cc", required=False,
+        help="map attribute sliders to CC numbers, e.g. "
+             "'velocity_mean=20,note_density=21,pitch_mean=22'",
+    )
 
     return argp.parse_args()
 
@@ -205,23 +347,32 @@ def get_epoch_time_ms() -> int:
     return round(time.time() * 1000)
 
 
+def _latent_forward(idxs, input_pos, max_kv_pos, offset):
+    """model_mlx Transformer forward with a per-layer z-residual added before
+    every block (mirrors torch AriaVAE.decode). Positions are already
+    EMBEDDING_OFFSET-shifted by the caller; the z-prefix lives at 0..K-1."""
+    m = LATENT.decoder.model
+    mask = m.causal_mask[None, None, input_pos, : max_kv_pos + 1]
+    x = m.tok_embeddings(idxs)
+    for li, layer in enumerate(m.encode_layers):
+        x = x + LATENT.residuals[li]
+        x = layer(x, input_pos, max_kv_pos, offset, mask)
+    x = m.out_layer_norm(x)
+    return LATENT.decoder.lm_head(x)
+
+
 def prefill(
     model: TransformerLM,
     idxs: mx.array,
     input_pos: mx.array,
 ) -> mx.array:
     # pad_idxs is only needed for prepended pad tokens
-    logits = model(
-        idxs=idxs,
-        input_pos=input_pos + EMBEDDING_OFFSET,
-        max_kv_pos=math.ceil(
-            (input_pos[-1].item() + EMBEDDING_OFFSET) / KV_CHUNK_SIZE
-        )
-        * KV_CHUNK_SIZE,
-        offset=input_pos[0] + EMBEDDING_OFFSET,
-    )
-
-    return logits
+    ip = input_pos + EMBEDDING_OFFSET
+    mkp = math.ceil((input_pos[-1].item() + EMBEDDING_OFFSET) / KV_CHUNK_SIZE) * KV_CHUNK_SIZE
+    off = input_pos[0] + EMBEDDING_OFFSET
+    if LATENT is not None:
+        return _latent_forward(idxs, ip, mkp, off)
+    return model(idxs=idxs, input_pos=ip, max_kv_pos=mkp, offset=off)
 
 
 def decode_one(
@@ -231,17 +382,12 @@ def decode_one(
 ) -> mx.array:
     assert input_pos.shape[-1] == 1
 
-    logits = model(
-        idxs=idxs,
-        input_pos=input_pos + EMBEDDING_OFFSET,
-        max_kv_pos=math.ceil(
-            (input_pos[-1].item() + EMBEDDING_OFFSET) / KV_CHUNK_SIZE
-        )
-        * KV_CHUNK_SIZE,
-        offset=input_pos[0] + EMBEDDING_OFFSET,
-    )[:, -1]
-
-    return logits
+    ip = input_pos + EMBEDDING_OFFSET
+    mkp = math.ceil((input_pos[-1].item() + EMBEDDING_OFFSET) / KV_CHUNK_SIZE) * KV_CHUNK_SIZE
+    off = input_pos[0] + EMBEDDING_OFFSET
+    if LATENT is not None:
+        return _latent_forward(idxs, ip, mkp, off)[:, -1]
+    return model(idxs=idxs, input_pos=ip, max_kv_pos=mkp, offset=off)[:, -1]
 
 
 def sample_min_p(logits: mx.array, p_base: float):
@@ -430,16 +576,20 @@ def _first_bad_dur_index(
         elif prim_tok == tokenizer.time_tok:
             num_time_toks += 1
         elif isinstance(prim_tok, tuple) and prim_tok[0] == "dur":
-            dur_true = prim_tok[1]
-            dur_pred = pred_tok[1]
-            if dur_pred > dur_true and (
-                local_onset_ms + dur_true
-                >= last_offset_ms - RECALC_DUR_BUFFER_MS
-            ):
-                logger.info(
-                    f"Found token to resample at {pos}: {prim_tok} -> {pred_tok}"
-                )
-                return pos
+            # The model's prediction at a dur position is not guaranteed to be a
+            # dur token (it can predict anything). Only resample when it actually
+            # predicted a longer duration; otherwise skip this position.
+            if isinstance(pred_tok, tuple) and pred_tok[0] == "dur":
+                dur_true = prim_tok[1]
+                dur_pred = pred_tok[1]
+                if dur_pred > dur_true and (
+                    local_onset_ms + dur_true
+                    >= last_offset_ms - RECALC_DUR_BUFFER_MS
+                ):
+                    logger.info(
+                        f"Found token to resample at {pos}: {prim_tok} -> {pred_tok}"
+                    )
+                    return pos
 
     return None
 
@@ -514,6 +664,7 @@ def decode_first_tokens(
     tokenizer: AbsTokenizer,
     generated_tokens_queue: queue.Queue,
     first_on_msg_epoch_ms: int,
+    catchup_discard: bool = False,
 ):
     logger = get_logger("GENERATE")
 
@@ -523,6 +674,18 @@ def decode_first_tokens(
     eos_tok_id = tokenizer.tok_to_id[tokenizer.eos_tok]
     dim_tok_id = tokenizer.tok_to_id[tokenizer.dim_tok]
     ped_off_id = tokenizer.tok_to_id[tokenizer.ped_off_tok]
+    # Structural special tokens that must never be generated (incl. the
+    # delimiter <X>); <T> (time) and pedal tokens stay valid.
+    structural_mask_ids = [
+        tokenizer.tok_to_id[t]
+        for t in (
+            tokenizer.bos_tok,
+            tokenizer.pad_tok,
+            tokenizer.unk_tok,
+            tokenizer.dim_tok,
+            tokenizer.delimiter_tok,
+        )
+    ]
 
     logits = first_token_logits
     time_since_first_onset_ms = get_epoch_time_ms() - first_on_msg_epoch_ms
@@ -531,6 +694,13 @@ def decode_first_tokens(
     num_time_toks_required = (time_since_first_onset_ms + buffer_ms) // 5000
     num_time_toks_in_priming_seq = priming_seq.count(tokenizer.time_tok)
     num_time_toks_to_add = num_time_toks_required - num_time_toks_in_priming_seq
+
+    if catchup_discard:
+        # Catchup mode: do NOT force the model's clock up to wall-clock. It
+        # continues from the last note; the elapsed pause is generated as real
+        # notes (later discarded as stale by stream_midi) rather than inserted
+        # as a rest. So suppress catch-up time tokens here.
+        num_time_toks_to_add = 0
 
     logger.info(f"Time since first onset: {time_since_first_onset_ms}ms")
     logger.info(f"Using first note-onset buffer: {buffer_ms}ms")
@@ -548,7 +718,7 @@ def decode_first_tokens(
         enc_seq[:, idx - 1] = time_tok_id
         idx += 1
 
-    logits[:, tokenizer.tok_to_id[tokenizer.dim_tok]] = float("-inf")
+    logits[:, structural_mask_ids] = float("-inf")
     logits[:, tokenizer.tok_to_id[tokenizer.eos_tok]] = float("-inf")
     logits[:, tokenizer.tok_to_id[tokenizer.ped_off_tok]] = float("-inf")
 
@@ -574,7 +744,11 @@ def decode_first_tokens(
         priming_seq, onset=True
     )
 
-    if priming_seq_last_onset_ms < time_since_first_onset_ms + buffer_ms:
+    if catchup_discard:
+        # Allow onsets "in the past": the model continues from the last note and
+        # those early notes are dropped downstream, so they must not be masked.
+        masked_onset_ids = []
+    elif priming_seq_last_onset_ms < time_since_first_onset_ms + buffer_ms:
         masked_onset_ids = [
             tokenizer.tok_to_id[tok]
             for tok in tokenizer.onset_tokens
@@ -606,7 +780,7 @@ def decode_first_tokens(
         next_log_probs = nn.log_softmax(next_logits, axis=-1)
 
         next_log_probs[:, eos_tok_id] = float("-inf")
-        next_log_probs[:, dim_tok_id] = float("-inf")
+        next_log_probs[:, structural_mask_ids] = float("-inf")
         next_log_probs[:, ped_off_id] = float("-inf")
 
         if masked_onset_ids:
@@ -666,6 +840,7 @@ def decode_tokens(
     temperature: float,
     min_p: float,
     is_ending: bool,
+    max_gen_ms: int | None = None,
 ):
     logger = get_logger("GENERATE")
     logger.info(
@@ -675,14 +850,40 @@ def decode_tokens(
     if control_sentinel.is_set():
         control_sentinel.clear()
 
+    # Duet mode bounds each burst by wall-clock time rather than by an external
+    # control signal. The deadline is measured from the first generated token
+    # (decode_tokens runs *after* prefill/first-token), so it caps actual token
+    # production, not the unavoidable prefill latency.
+    deadline_ms = (
+        get_epoch_time_ms() + max_gen_ms if max_gen_ms is not None else None
+    )
+
     last_tok_is_pedal = False
     dur_ids = [tokenizer.tok_to_id[idx] for idx in tokenizer.dur_tokens]
     dur_mask_ids = [
         tokenizer.tok_to_id[("dur", dur_ms)]
         for dur_ms in range(0, MIN_NOTE_LENGTH_MS, 10)
     ]
+    # Structural special tokens that must never appear inside the generated
+    # stream -- they break the note decoder. High temperature / low min_p can
+    # otherwise sample them (e.g. the delimiter <X>). <T> (time) and the pedal
+    # tokens stay valid; eos is handled separately below.
+    structural_mask_ids = [
+        tokenizer.tok_to_id[t]
+        for t in (
+            tokenizer.bos_tok,
+            tokenizer.pad_tok,
+            tokenizer.unk_tok,
+            tokenizer.dim_tok,
+            tokenizer.delimiter_tok,
+        )
+    ]
 
-    while (not control_sentinel.is_set()) and idx < MAX_SEQ_LEN:
+    while (
+        (not control_sentinel.is_set())
+        and idx < MAX_SEQ_LEN
+        and (deadline_ms is None or get_epoch_time_ms() < deadline_ms)
+    ):
         decode_one_start_time_s = time.time()
         prev_tok_id = enc_seq[0, idx - 1]
         prev_tok = tokenizer.id_to_tok[prev_tok_id.item()]
@@ -698,7 +899,7 @@ def decode_tokens(
         )
 
         logits[:, tokenizer.tok_to_id[tokenizer.ped_off_tok]] += 3  # Manual adj
-        logits[:, tokenizer.tok_to_id[tokenizer.dim_tok]] = float("-inf")
+        logits[:, structural_mask_ids] = float("-inf")
 
         logits[:, dur_mask_ids] = float("-inf")
         if last_tok_is_pedal is True:
@@ -747,6 +948,8 @@ def generate_tokens(
     temperature: float = 0.98,
     min_p: float = 0.03,
     is_ending: bool = False,
+    max_gen_ms: int | None = None,
+    catchup_discard: bool = False,
 ):
     logger = get_logger("GENERATE")
 
@@ -808,6 +1011,7 @@ def generate_tokens(
         tokenizer=tokenizer,
         generated_tokens_queue=generated_tokens_queue,
         first_on_msg_epoch_ms=first_on_msg_epoch_ms,
+        catchup_discard=catchup_discard,
     )
 
     logger.info(
@@ -827,6 +1031,7 @@ def generate_tokens(
         temperature=temperature,
         min_p=min_p,
         is_ending=is_ending,
+        max_gen_ms=max_gen_ms,
     )
 
 
@@ -963,10 +1168,20 @@ def decode_tokens_to_midi(
 ):
     logger = get_logger("DECODE")
 
-    assert (
+    # Normally the context's last onset is in the past. In duet mode the model
+    # generates ahead of wall-clock, so a burst can briefly start while the
+    # previous context still extends into the future. run_duet catches wall-clock
+    # up before each burst to keep this rare; downgrade the old hard assert to a
+    # warning so an edge case can't kill this thread (which would hang stream_midi).
+    if (
         first_on_msg_epoch_ms + priming_seq_last_onset_ms
-        < get_epoch_time_ms() + HARDWARE_INPUT_LATENCY_MS
-    )
+        >= get_epoch_time_ms() + HARDWARE_INPUT_LATENCY_MS
+    ):
+        logger.warning(
+            "Context last onset is ahead of wall-clock by "
+            f"{first_on_msg_epoch_ms + priming_seq_last_onset_ms - get_epoch_time_ms()}ms; "
+            "proceeding (notes will be scheduled slightly ahead)."
+        )
 
     logger.info(f"Priming sequence last onset: {priming_seq_last_onset_ms}")
     logger.info(
@@ -976,6 +1191,9 @@ def decode_tokens_to_midi(
     pitch_to_prev_msg = {}
     note_buffer = []
     num_time_toks = priming_seq_last_onset_ms // 5000
+    # Running offset of the last decoded note; also the fallback time for the
+    # end marker if generation stops before any note is decoded.
+    offset_epoch_ms = first_on_msg_epoch_ms + priming_seq_last_onset_ms
 
     while True:
         while True:
@@ -996,6 +1214,18 @@ def decode_tokens_to_midi(
                 return
 
             elif tok is None:
+                # Deadline / sequence-limit end (e.g. duet mode). Emit the same
+                # pitch=-1 end marker the EOS path uses, otherwise stream_midi
+                # loops forever waiting for a control signal that never arrives.
+                _uuid = uuid.uuid4()
+                end_msg = {
+                    "pitch": -1,
+                    "vel": -1,
+                    "epoch_time_ms": offset_epoch_ms + 100,
+                    "send_epoch_time_ms": offset_epoch_ms + 100,
+                    "uuid": _uuid,
+                }
+                outbound_midi_msg_queue.put(end_msg)
                 logger.info(f"Seen exit signal: Sentinel")
                 return
 
@@ -1019,31 +1249,52 @@ def decode_tokens_to_midi(
             num_time_toks += 1
             note_buffer.pop(0)
 
-        assert len(note_buffer) in {2, 3}, f"Generation error: buffer={note_buffer}"  # fmt: skip
+        # Defensive: the model can emit a malformed group -- consecutive pitch
+        # tokens, a missing onset, or (at extreme sampling) a stray structural
+        # token. Require a real note [piano, onset, dur] or pedal [PED, onset]
+        # and skip anything else, rather than crash the decoder thread.
+        valid_note = (
+            msg_type == "note"
+            and len(note_buffer) == 3
+            and isinstance(note_buffer[0], tuple) and note_buffer[0][0] == "piano"
+            and isinstance(note_buffer[1], tuple) and note_buffer[1][0] == "onset"
+            and isinstance(note_buffer[2], tuple) and note_buffer[2][0] == "dur"
+        )
+        valid_pedal = (
+            msg_type == "pedal"
+            and len(note_buffer) == 2
+            and note_buffer[0] in {tokenizer.ped_on_tok, tokenizer.ped_off_tok}
+            and isinstance(note_buffer[1], tuple) and note_buffer[1][0] == "onset"
+        )
+        if not (valid_note or valid_pedal):
+            logger.warning(f"Skipping malformed token group: {note_buffer}")
+            note_buffer = []
+            continue
 
         logger.debug(f"Decoded note: {note_buffer}")
 
-        if msg_type == "note":
-            offset_epoch_ms = _decode_note_triple(
-                note_buffer=note_buffer,
-                first_on_msg_epoch_ms=first_on_msg_epoch_ms,
-                num_time_toks=num_time_toks,
-                pitch_to_prev_msg=pitch_to_prev_msg,
-                outbound_midi_msg_queue=outbound_midi_msg_queue,
-                logger=logger,
-            )
-        elif msg_type == "pedal":
-            offset_epoch_ms = _decode_pedal_double(
-                note_buffer=note_buffer,
-                first_on_msg_epoch_ms=first_on_msg_epoch_ms,
-                num_time_toks=num_time_toks,
-                pitch_to_prev_msg=pitch_to_prev_msg,
-                outbound_midi_msg_queue=outbound_midi_msg_queue,
-                logger=logger,
-                tokenizer=tokenizer,
-            )
-        else:
-            raise ValueError
+        try:
+            if msg_type == "note":
+                offset_epoch_ms = _decode_note_triple(
+                    note_buffer=note_buffer,
+                    first_on_msg_epoch_ms=first_on_msg_epoch_ms,
+                    num_time_toks=num_time_toks,
+                    pitch_to_prev_msg=pitch_to_prev_msg,
+                    outbound_midi_msg_queue=outbound_midi_msg_queue,
+                    logger=logger,
+                )
+            else:  # pedal
+                offset_epoch_ms = _decode_pedal_double(
+                    note_buffer=note_buffer,
+                    first_on_msg_epoch_ms=first_on_msg_epoch_ms,
+                    num_time_toks=num_time_toks,
+                    pitch_to_prev_msg=pitch_to_prev_msg,
+                    outbound_midi_msg_queue=outbound_midi_msg_queue,
+                    logger=logger,
+                    tokenizer=tokenizer,
+                )
+        except Exception as e:
+            logger.warning(f"Skipping un-decodable token group {note_buffer}: {e}")
 
         note_buffer = []
 
@@ -1088,7 +1339,7 @@ def stream_midi(
     pending_msgs = []
     msgs_to_archive = []
 
-    with mido.open_output(midi_output_port) as midi_out:
+    with open_output(midi_output_port) as midi_out:
         while not control_sentinel.is_set():
             while not inbound_midi_msg_queue.empty():
                 try:
@@ -1197,7 +1448,9 @@ def stream_midi(
             )
         )
 
-    results_queue.put(msgs)
+    # Also report the epoch of the last scheduled note so duet mode can let
+    # wall-clock catch up to the model's look-ahead before the next burst.
+    results_queue.put((msgs, last_archive_time_ms))
 
 
 def stream_msgs(
@@ -1213,6 +1466,8 @@ def stream_msgs(
     num_preceding_active_pitches: int,
     midi_stream_channel: int,
     is_ending: bool = False,
+    max_gen_ms: int | None = None,
+    timing_out: dict | None = None,
 ):
 
     logger = get_logger("STREAM")
@@ -1235,6 +1490,42 @@ def stream_msgs(
         )
         priming_seq.append(tokenizer.dim_tok)
 
+    # Seamless turn-switch: freeze the clock so the model continues on-grid from
+    # just after the last captured note instead of snapping its first note to
+    # wall-clock. Re-anchoring first_on here keeps generation timing, output
+    # scheduling, and the archive baseline (all below) mutually consistent.
+    # Gated to turn-taking (max_gen_ms is None); duet manages its own timing.
+    # Degrades gracefully: if the freeze latency is under-estimated the model
+    # simply catches up toward now (never schedules in the past), so no notes
+    # are dropped.
+    # Turn-switch timing modes (turn-taking only; duet manages its own timing).
+    catchup_discard = False
+    if max_gen_ms is None and not is_ending:
+        if TURN_SWITCH_MODE == "freeze":
+            priming_last_onset_ms = tokenizer.calc_length_ms(
+                priming_seq, onset=True
+            )
+            first_on_msg_epoch_ms = (
+                get_epoch_time_ms()
+                - priming_last_onset_ms
+                + TURN_FREEZE_LATENCY_MS
+            )
+            logger.info(
+                f"Turn-switch [freeze]: froze clock "
+                f"(latency={TURN_FREEZE_LATENCY_MS}ms), re-anchored first_on"
+            )
+        elif TURN_SWITCH_MODE == "catchup":
+            # Keep the original anchor; tell decode_first_tokens to NOT insert
+            # catch-up time tokens or mask past onsets, so the model continues
+            # from the last note. Notes whose scheduled time is already in the
+            # past are dropped downstream by stream_midi's stale-skip, so the
+            # first audible note lands on the original grid at wall-clock now.
+            catchup_discard = True
+            logger.info(
+                "Turn-switch [catchup]: continue through the pause, discard "
+                "past notes, join on the original grid"
+            )
+
     generated_tokens_queue = queue.Queue()
     midi_messages_queue = queue.Queue()
 
@@ -1252,6 +1543,8 @@ def stream_msgs(
             "num_preceding_active_pitches": num_preceding_active_pitches,
             "first_on_msg_epoch_ms": first_on_msg_epoch_ms,
             "is_ending": is_ending,
+            "max_gen_ms": max_gen_ms,
+            "catchup_discard": catchup_discard,
         },
     )
     generate_tokens_thread.start()
@@ -1297,7 +1590,9 @@ def stream_msgs(
     generate_tokens_thread.join()
     decode_tokens_to_midi_thread.join()
     stream_midi_thread.join()
-    msgs = stream_midi_results_queue.get()
+    msgs, last_scheduled_epoch_ms = stream_midi_results_queue.get()
+    if timing_out is not None:
+        timing_out["last_epoch_ms"] = last_scheduled_epoch_ms
 
     return msgs
 
@@ -1505,7 +1800,7 @@ def capture_and_update_kv(
     midi_performance_queue: queue.Queue,
     midi_capture_channel: int,
     first_msg_epoch_time_ms: int | None = None,
-    idle_timeout_ms: int | None = None,
+    flush_pending: bool = True,
 ):
     received_messages_queue = queue.Queue()
     results_queue = queue.Queue()
@@ -1520,7 +1815,7 @@ def capture_and_update_kv(
             "first_msg_epoch_time_ms": first_msg_epoch_time_ms,
             "results_queue": results_queue,
             "wait_for_close": wait_for_close,
-            "idle_timeout_ms": idle_timeout_ms,
+            "flush_pending": flush_pending,
         },
     )
     capture_midi_thread.start()
@@ -1546,17 +1841,42 @@ def capture_midi_input(
     results_queue: queue.Queue,
     first_msg_epoch_time_ms: int | None = None,
     wait_for_close: bool = False,
-    idle_timeout_ms: int | None = None,
+    flush_pending: bool = True,
 ):
     logger = get_logger("CAPTURE")
+
+    # Timeline baseline: epoch of the previous message ACTUALLY emitted to the
+    # context. Updated only on emit (in emit_to_context), so dropped pedal values
+    # between events never steal elapsed time from the context timeline.
+    last_emit_epoch_ms = first_msg_epoch_time_ms
+
+    def emit_to_context(m, epoch_ms):
+        # Log (at INFO) and enqueue EXACTLY the messages that populate the
+        # model's context. The time delta is measured from the previous EMITTED
+        # message, not the previous raw input -- so filtered/deduped pedal values
+        # (and the gaps around them) don't compress the timeline. Raw input is
+        # logged at DEBUG.
+        nonlocal last_emit_epoch_ms
+        m.time = 0 if last_emit_epoch_ms is None else (epoch_ms - last_emit_epoch_ms)
+        last_emit_epoch_ms = epoch_ms
+        logger.info(f"[CONTEXT] {m}")
+        received_messages_queue.put(m)
+
     first_on_msg_epoch_ms = None
-    prev_msg_epoch_time_ms = first_msg_epoch_time_ms
     pedal_down = False
     pitches_held_down = set()
     pitches_sustained_by_pedal = set()
-    waiting_since_ms = None
 
-    while not midi_performance_queue.empty():
+    # A fresh start (e.g. right after a reset) has no prior context, signalled by
+    # first_msg_epoch_time_ms being None. In that case begin the context at the
+    # first note: ignore any leading messages (e.g. a continuously-streaming
+    # sustain pedal) and the silence before the first note-on, so the recorded
+    # timeline starts exactly at that note rather than at "capture start".
+    waiting_for_first_note = first_msg_epoch_time_ms is None
+
+    # In duet mode we must NOT discard notes the player performed during the
+    # model's burst, so flushing is made optional.
+    while flush_pending and not midi_performance_queue.empty():
         try:
             midi_performance_queue.get_nowait()
         except queue.Empty:
@@ -1564,10 +1884,6 @@ def capture_midi_input(
 
     logger.info("Listening for input")
     logger.info("Commencing generation upon keypress or control signal")
-
-    if idle_timeout_ms is not None:
-        waiting_since_ms = get_epoch_time_ms()
-        logger.info(f"Idle timeout enabled: {idle_timeout_ms}ms")
 
     while True:
         epoch_time_ms = get_epoch_time_ms()
@@ -1581,31 +1897,35 @@ def capture_midi_input(
         try:
             msg = midi_performance_queue.get(block=True, timeout=0.01)
         except queue.Empty:
-            if (
-                idle_timeout_ms is not None
-                and waiting_since_ms is not None
-                and first_on_msg_epoch_ms is None
-                and (get_epoch_time_ms() - waiting_since_ms) > idle_timeout_ms
-            ):
-                logger.info(
-                    f"Idle timeout reached ({idle_timeout_ms}ms), resetting"
-                )
-                reset_sentinel.set()
-                control_sentinel.set()
-                break
             continue
 
         if msg.is_meta or msg.type == "program_change":
             continue
 
-        msg.channel = midi_capture_channel
-        if prev_msg_epoch_time_ms is None:
-            msg.time = 0
-        else:
-            msg.time = epoch_time_ms - prev_msg_epoch_time_ms
+        # Drop everything before the first real event on a fresh start, so
+        # leading silence (and a streaming pedal at rest) never enters the
+        # context. prev epoch stays unset until then, so the first event lands
+        # at time 0. A valid first event is a note-on OR a pedal-DOWN (sustain
+        # pressed before the first note); a pedal-UP does not open the context.
+        # NOTE: standard pedal polarity -> DOWN (pressed) is CC64 value >= 64.
+        if waiting_for_first_note:
+            is_first_event = (
+                msg.type == "note_on" and msg.velocity > 0
+            ) or (
+                msg.type == "control_change"
+                and msg.control == 64
+                and msg.value >= 64
+            )
+            if is_first_event:
+                waiting_for_first_note = False
+                # Anchor the timeline (and wall-clock sync) to this first event,
+                # whether it's the note or the opening pedal-down.
+                first_on_msg_epoch_ms = epoch_time_ms - HARDWARE_INPUT_LATENCY_MS
+            else:
+                continue
 
-        prev_msg_epoch_time_ms = epoch_time_ms
-        logger.info(f"Received message: [{msg}]")
+        msg.channel = midi_capture_channel
+        logger.debug(f"Raw input message: [{msg}]")
 
         match msg.type:
             case "note_on" if msg.velocity > 0:
@@ -1616,45 +1936,53 @@ def capture_midi_input(
                 pitches_held_down.add(msg.note)
                 if pedal_down:
                     pitches_sustained_by_pedal.add(msg.note)
-                received_messages_queue.put(msg)
+                emit_to_context(msg, epoch_time_ms)
 
             case "note_off" | "note_on":
                 # Note-off
                 pitches_held_down.discard(msg.note)
-                received_messages_queue.put(msg)
+                emit_to_context(msg, epoch_time_ms)
 
             case "control_change" if msg.control == 64:
-                if msg.value >= 64:
-                    pedal_down = True
-                    pitches_sustained_by_pedal.update(pitches_held_down)
-                else:
-                    pedal_down = False
-                    pitches_sustained_by_pedal.clear()
-                received_messages_queue.put(msg)
+                # Binary pedal with a single threshold at 64 (standard polarity):
+                # DOWN (sustain on) when CC64 >= 64, UP (off) when < 64. Emit only
+                # on a state change so the stream of intermediate values from a
+                # continuous pedal doesn't flood the model. (Pianoteq still gets
+                # the raw continuous pedal.)
+                new_pedal_down = msg.value >= 64
+                if new_pedal_down != pedal_down:
+                    pedal_down = new_pedal_down
+                    if pedal_down:
+                        pitches_sustained_by_pedal.update(pitches_held_down)
+                        msg.value = 127
+                    else:
+                        pitches_sustained_by_pedal.clear()
+                        msg.value = 0
+                    emit_to_context(msg, epoch_time_ms)
 
     active_pitches = pitches_held_down.union(pitches_sustained_by_pedal)
     num_active_pitches = len(active_pitches)
     logger.info(f"Active pitches ({num_active_pitches}): {active_pitches}")
 
-    time_offset = get_epoch_time_ms() - prev_msg_epoch_time_ms
+    # Close out the capture at "now": held notes get a final note-off and the
+    # pedal is released. emit_to_context sets each message's delta from the
+    # previous emitted event, so the first cleanup message carries the real gap
+    # since the last event and the rest are simultaneous (time 0). If nothing was
+    # captured, last_emit_epoch_ms is None and these land at time 0 harmlessly.
+    cleanup_epoch_ms = get_epoch_time_ms()
     for pitch in pitches_held_down:
-        note_off_msg = mido.Message(
-            "note_off",
-            note=pitch,
-            channel=midi_capture_channel,
-            time=time_offset,
+        logger.info("[CONTEXT] (capture-end cleanup) note_off")
+        emit_to_context(
+            mido.Message("note_off", note=pitch, channel=midi_capture_channel),
+            cleanup_epoch_ms,
         )
-        received_messages_queue.put(note_off_msg)
-        time_offset = 0
 
-    received_messages_queue.put(
+    logger.info("[CONTEXT] (capture-end cleanup) forced pedal-off")
+    emit_to_context(
         mido.Message(
-            "control_change",
-            control=64,
-            value=0,
-            channel=midi_capture_channel,
-            time=0,
-        )
+            "control_change", control=64, value=0, channel=midi_capture_channel
+        ),
+        cleanup_epoch_ms,
     )
 
     received_messages_queue.put(None)
@@ -1685,7 +2013,7 @@ def play_midi_file(
         mid = mido.MidiFile(midi_path)
 
     time.sleep(1)
-    with mido.open_output(midi_through_port) as through_port:
+    with open_output(midi_through_port) as through_port:
         for msg in mid.play():
             if reset_sentinel.is_set():
                 logger.debug("Exiting")
@@ -1779,8 +2107,9 @@ def _listen(
             msg.type == "control_change"
             and msg.control == midi_reset_control_signal
             and msg.value >= 64
-            and should_return_signal
         ):
+            # Reset is NOT gated by should_return_signal: clearing the context
+            # needs no prior note and must work even when idle between phrases.
             return midi_reset_control_signal
 
 
@@ -1950,13 +2279,211 @@ def run(
                 midi_performance_queue=midi_performance_queue,
                 midi_capture_channel=curr_midi_channel,
                 first_msg_epoch_time_ms=first_on_msg_epoch_ms,
-                idle_timeout_ms=3000,
             )
 
     keypress_thread.join()
     midi_control_thread.join()
     if play_file_thread:
         play_file_thread.join()
+
+
+def _next_duet_channel(channel: int) -> int:
+    """Cycle 1..15, skipping 9 (drums) and wrapping. Channel 0 is reserved for
+    the very first capture window."""
+    channel += 1
+    if channel == 9:  # Skip drum channel
+        channel += 1
+    if channel > 15:
+        channel = 1
+    return channel
+
+
+def run_duet(
+    model: TransformerLM,
+    midi_performance_queue: queue.Queue,
+    midi_control_queue: queue.Queue,
+    midi_out_port: str | None,
+    midi_save_path: str | None,
+    midi_reset_control_signal: int,
+    reset_sentinel: threading.Event,
+    temperature: float,
+    min_p: float,
+    listen_ms: int,
+    play_ms: int,
+):
+    """Experimental duet mode: you and the model perform *together*.
+
+    Rather than waiting for an explicit hand-off, this alternates very short
+    capture and generation windows in a tight loop. Two things make it a duet
+    rather than fast turn-taking:
+
+      1. The capture phase does NOT flush pending input (flush_pending=False),
+         so notes you play *during* the model's burst are preserved.
+      2. Both your captured notes and the model's generated notes accumulate in
+         `msgs`, which is re-tokenized as the priming context for every burst -
+         so each side hears the other with roughly one window of latency.
+
+    Reset (CC reset signal / a letter + Enter) clears the shared context and
+    restarts with a clean channel cycle.
+    """
+    logger = get_logger("DUET")
+    tokenizer = AbsTokenizer(config_path=TOKENIZER_CONFIG_PATH)
+    control_sentinel = threading.Event()
+    currently_generating_sentinel = threading.Event()
+
+    if midi_out_port:
+        close_notes(midi_out_port)
+
+    # Only the reset signal is meaningful in duet mode (takeover is automatic),
+    # so disable the takeover CC by passing midi_control_signal=None.
+    midi_control_thread = threading.Thread(
+        target=listen_for_midi_control_signal,
+        kwargs={
+            "midi_control_queue": midi_control_queue,
+            "control_sentinel": control_sentinel,
+            "reset_sentinel": reset_sentinel,
+            "currently_generating_sentinel": currently_generating_sentinel,
+            "midi_control_signal": None,
+            "midi_reset_control_signal": midi_reset_control_signal,
+            "back_and_forth": True,
+        },
+        daemon=True,
+    )
+    keypress_thread = threading.Thread(
+        target=listen_for_keypress_control_signal,
+        kwargs={
+            "control_sentinel": control_sentinel,
+            "reset_sentinel": reset_sentinel,
+            "currently_generating_sentinel": currently_generating_sentinel,
+            "back_and_forth": True,
+        },
+        daemon=True,
+    )
+    midi_control_thread.start()
+    keypress_thread.start()
+
+    def _window(window_ms: int) -> threading.Timer:
+        # Bound the next phase to window_ms by setting the control sentinel.
+        control_sentinel.clear()
+        timer = threading.Timer(window_ms / 1000.0, control_sentinel.set)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    logger.info(
+        f"Duet mode started (listen={listen_ms}ms, play={play_ms}ms). "
+        "Play along; reset to start fresh."
+    )
+
+    # Initial capture: flush once so we begin from a clean slate.
+    timer = _window(listen_ms)
+    msgs, prev_context, first_on_msg_epoch_ms, num_active_pitches = (
+        capture_and_update_kv(
+            model=model,
+            msgs=[],
+            prev_context=[],
+            control_sentinel=control_sentinel,
+            reset_sentinel=reset_sentinel,
+            wait_for_close=False,
+            midi_performance_queue=midi_performance_queue,
+            midi_capture_channel=0,
+            flush_pending=True,
+        )
+    )
+    timer.cancel()
+
+    curr_midi_channel = 1
+    while not reset_sentinel.is_set():
+        # The model needs something to continue from. Until you've played a
+        # note, keep listening (channel 0) rather than generating from nothing
+        # (which would also crash convert_msgs_to_midi on an empty timeline).
+        if not msgs or first_on_msg_epoch_ms is None:
+            timer = _window(listen_ms)
+            msgs, prev_context, first_on_msg_epoch_ms, num_active_pitches = (
+                capture_and_update_kv(
+                    model=model,
+                    msgs=msgs,
+                    prev_context=prev_context,
+                    control_sentinel=control_sentinel,
+                    reset_sentinel=reset_sentinel,
+                    wait_for_close=False,
+                    midi_performance_queue=midi_performance_queue,
+                    midi_capture_channel=0,
+                    flush_pending=False,
+                )
+            )
+            timer.cancel()
+            continue
+
+        # --- Model burst ---
+        # The burst self-terminates after play_ms of token generation via
+        # max_gen_ms (a timer can't bound it: decode_tokens clears the control
+        # sentinel on entry). control_sentinel is left for reset handling only.
+        currently_generating_sentinel.set()
+        control_sentinel.clear()
+        timing = {}
+        msgs = stream_msgs(
+            model=model,
+            tokenizer=tokenizer,
+            msgs=msgs,
+            prev_context=prev_context,
+            midi_output_port=midi_out_port,
+            first_on_msg_epoch_ms=first_on_msg_epoch_ms,
+            control_sentinel=control_sentinel,
+            temperature=temperature,
+            min_p=min_p,
+            num_preceding_active_pitches=num_active_pitches,
+            midi_stream_channel=curr_midi_channel,
+            is_ending=False,
+            max_gen_ms=play_ms,
+            timing_out=timing,
+        )
+        currently_generating_sentinel.clear()
+
+        if midi_save_path:
+            # Best-effort: reused channels in long duets can yield out-of-order
+            # per-track deltas that mido's file writer rejects (negative time).
+            # The in-memory timeline still works; just skip the snapshot on error.
+            try:
+                convert_msgs_to_midi(msgs=msgs).save(midi_save_path)
+            except ValueError as e:
+                logger.warning(f"Skipping duet MIDI snapshot: {e}")
+
+        curr_midi_channel = _next_duet_channel(curr_midi_channel)
+        if reset_sentinel.is_set():
+            break
+
+        # --- Player capture window (no flush: keep what you played) ---
+        # The model schedules notes slightly ahead of wall-clock. Hold the
+        # capture window open until those notes have played out (plus a small
+        # buffer), so: (a) you play *over* the model's phrase and it's captured,
+        # and (b) the context's last onset is in the past before the next burst
+        # (which keeps decode_tokens_to_midi's precondition satisfied). Bounded
+        # below by listen_ms and above by DUET_MAX_CATCHUP_MS.
+        window_ms = listen_ms
+        last_epoch_ms = timing.get("last_epoch_ms")
+        if last_epoch_ms is not None:
+            catchup_ms = last_epoch_ms + DUET_CATCHUP_BUFFER_MS - get_epoch_time_ms()
+            window_ms = max(listen_ms, min(int(catchup_ms), DUET_MAX_CATCHUP_MS))
+
+        timer = _window(window_ms)
+        msgs, prev_context, _, num_active_pitches = capture_and_update_kv(
+            model=model,
+            msgs=msgs,
+            prev_context=prev_context,
+            control_sentinel=control_sentinel,
+            reset_sentinel=reset_sentinel,
+            wait_for_close=False,
+            midi_performance_queue=midi_performance_queue,
+            midi_capture_channel=curr_midi_channel,
+            first_msg_epoch_time_ms=first_on_msg_epoch_ms,
+            flush_pending=False,
+        )
+        timer.cancel()
+        curr_midi_channel = _next_duet_channel(curr_midi_channel)
+
+    midi_control_thread.join()
+    keypress_thread.join()
 
 
 def insert_embedding(
@@ -1977,6 +2504,52 @@ def insert_embedding(
     EMBEDDING_OFFSET = 1
 
 
+def load_latent(weights_dir, tokenizer, quantize, gain_sigma):
+    """Build the AriaVAE-MLX latent model + controller. Returns (vae, ctrl).
+    The returned vae.decoder IS the model the demo drives."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "studio", "mlx_vae"))
+    from aria_vae_mlx import AriaVAEMLX
+    from latent_control import LatentController
+    vae = AriaVAEMLX.load(weights_dir, quantize=quantize, dtype=DTYPE)
+    ctrl = LatentController(_os.path.join(weights_dir, "latent_directions.npz"),
+                           gain_sigma=gain_sigma)
+    return vae, ctrl
+
+
+def set_latent_base(vae, ctrl, tokenizer, seed_midi, use_prior):
+    """Set the base latent z: encode a seed MIDI (style anchor) or sample the
+    prior. Then materialise prefix + per-layer residuals + the K-token offset."""
+    import numpy as _np
+    logger = get_logger()
+    if use_prior or not seed_midi:
+        z = _np.random.randn(vae.z_dim).astype(_np.float32)
+        logger.info("Latent base: prior sample z~N(0,I)")
+    else:
+        from ariautils.midi import MidiDict
+        ids = tokenizer.encode(tokenizer.tokenize(MidiDict.from_midi(seed_midi)))[:1024]
+        mu = vae.encode(mx.array(_np.asarray(ids, _np.int32)[None, :]))
+        mx.eval(mu)
+        z = _np.array(mu)[0]
+        ctrl.set_base(z)
+        logger.info(f"Latent base: encoded '{os.path.basename(seed_midi)}' "
+                    f"({len(ids)} toks); predicted attrs "
+                    f"{ {k: round(v,1) for k,v in ctrl.predicted_attrs(z).items()} }")
+        z = ctrl.base
+    ctrl.set_base(z)
+    vae.set_z(mx.array(ctrl.z()))
+    global EMBEDDING_OFFSET
+    EMBEDDING_OFFSET = vae.K
+
+
+def apply_latent_slider(attr_idx, cc_value):
+    """Update one attribute slider from a CC and recompute z (live)."""
+    if LATENT is None or LATENT_CTRL is None:
+        return
+    LATENT_CTRL.set_cc(attr_idx, cc_value)
+    LATENT.set_z(mx.array(LATENT_CTRL.z()))  # residuals update live; prefix staged
+
+
 def forward_midi_input_port(
     midi_input_port: str,
     midi_control_queue: queue.Queue,
@@ -1995,6 +2568,12 @@ def forward_midi_input_port(
             while True:
                 msg = midi_in.receive(block=True)
                 if msg:
+                    # Latent slider CCs are applied immediately (live z update)
+                    # and not forwarded — they are neither notes nor turn signals.
+                    if (LATENT is not None and msg.type == "control_change"
+                            and msg.control in SLIDER_MAP):
+                        apply_latent_slider(SLIDER_MAP[msg.control], msg.value)
+                        continue
                     midi_control_queue.put(msg)
                     if midi_performance_queue is not None:
                         midi_performance_queue.put(msg)
@@ -2007,20 +2586,72 @@ def forward_midi_input_port(
 
 def main(args):
     logger = get_logger()
-    model = load_model(checkpoint_path=args.checkpoint)
-    model = warmup_model(model=model)
-    global EMBEDDING_OFFSET
-    if args.embedding_checkpoint and args.embedding_midi_path:
-        insert_embedding(
-            model=model,
-            embedding_model_checkpoint_path=args.embedding_checkpoint,
-            embedding_midi_path=args.embedding_midi_path,
+    # Apply CLI-configurable globals before the model cache is built / used.
+    global TURN_SWITCH_MODE, TURN_FREEZE_LATENCY_MS, MAX_SEQ_LEN
+    TURN_SWITCH_MODE = args.turn_switch_mode
+    TURN_FREEZE_LATENCY_MS = args.turn_freeze_latency_ms
+    MAX_SEQ_LEN = args.max_seq_len
+    logger.info(f"Max sequence length (context window): {MAX_SEQ_LEN} tokens")
+    logger.info(
+        f"Turn-switch mode: {TURN_SWITCH_MODE}"
+        + (
+            f" (freeze latency {TURN_FREEZE_LATENCY_MS}ms)"
+            if TURN_SWITCH_MODE == "freeze"
+            else ""
         )
+    )
+    # Create the output port up front so a virtual port (e.g. the Pianoteq
+    # target) is visible to other apps immediately and for the whole session.
+    if args.midi_out and args.midi_out not in mido.get_output_names():
+        open_output(args.midi_out)
+        logger.info(f"Created persistent virtual MIDI port: '{args.midi_out}'")
+    global EMBEDDING_OFFSET, LATENT, LATENT_CTRL, SLIDER_MAP
+    if args.latent_dir:
+        # --- AriaVAE latent mode: the VAE decoder is the model; a z-prefix +
+        # per-layer z-residuals inject the controllable latent. ---
+        tokenizer = AbsTokenizer(config_path=TOKENIZER_CONFIG_PATH)
+        LATENT, LATENT_CTRL = load_latent(
+            args.latent_dir, tokenizer, args.quantize, args.latent_gain
+        )
+        SLIDER_MAP = {}
+        if args.latent_slider_cc:
+            for pair in args.latent_slider_cc.split(","):
+                name, cc = pair.split("=")
+                SLIDER_MAP[int(cc)] = LATENT_CTRL.attr_index(name.strip())
+        model = LATENT.decoder
+        model_max = getattr(model.model_config, "max_seq_len", MAX_SEQ_LEN)
+        if MAX_SEQ_LEN > model_max:
+            logger.warning(f"--max_seq_len clamped to model max {model_max}")
+            MAX_SEQ_LEN = model_max
+        LATENT.setup_stream(MAX_SEQ_LEN)
+        set_latent_base(LATENT, LATENT_CTRL, tokenizer,
+                        args.latent_seed_midi, args.latent_prior)  # sets EMBEDDING_OFFSET=K
+        model = warmup_model(model=model)
+        LATENT.prefill_prefix()  # write z-prefix into KV positions 0..K-1 (post-warmup)
+        logger.info(f"Latent control ON — {LATENT_CTRL.slider_report()}")
+        logger.info(f"Slider CCs: {args.latent_slider_cc or '(none mapped)'}")
     else:
-        model.fill_condition_kv(
-            mx.zeros((1, model.model_config.emb_size), dtype=DTYPE)
-        )
-        EMBEDDING_OFFSET = 1
+        model = load_model(checkpoint_path=args.checkpoint)
+        # Don't exceed the model's positional capacity (RoPE is built for this).
+        model_max = getattr(model.model_config, "max_seq_len", MAX_SEQ_LEN)
+        if MAX_SEQ_LEN > model_max:
+            logger.warning(
+                f"--max_seq_len {MAX_SEQ_LEN} exceeds the model's trained max "
+                f"{model_max}; clamping to {model_max}."
+            )
+            MAX_SEQ_LEN = model_max
+        model = warmup_model(model=model)
+        if args.embedding_checkpoint and args.embedding_midi_path:
+            insert_embedding(
+                model=model,
+                embedding_model_checkpoint_path=args.embedding_checkpoint,
+                embedding_midi_path=args.embedding_midi_path,
+            )
+        else:
+            model.fill_condition_kv(
+                mx.zeros((1, model.model_config.emb_size), dtype=DTYPE)
+            )
+            EMBEDDING_OFFSET = 1
 
     assert (args.midi_path and os.path.isfile(args.midi_path)) or args.midi_in
 
@@ -2042,24 +2673,54 @@ def main(args):
         )
         forwarder_thread.start()
 
+    if args.control_midi_in:
+        # Dedicated control-signal port (e.g. MC8 footswitch). Forward only to
+        # the control queue with no performance queue, so its CCs trigger
+        # takeover/reset but are never tokenized as notes.
+        control_forwarder_thread = threading.Thread(
+            target=forward_midi_input_port,
+            kwargs={
+                "midi_input_port": args.control_midi_in,
+                "midi_control_queue": midi_control_queue,
+                "midi_performance_queue": None,
+            },
+            daemon=True,
+        )
+        control_forwarder_thread.start()
+
     reset_sentinel = threading.Event()
     while True:
-        run(
-            model=model,
-            midi_performance_queue=midi_performance_queue,
-            midi_control_queue=midi_control_queue,
-            midi_through_port=args.midi_through,
-            midi_out_port=args.midi_out,
-            midi_path=args.midi_path,
-            midi_save_path=args.save_path,
-            midi_control_signal=args.midi_control_signal,
-            midi_reset_control_signal=args.midi_reset_control_signal,
-            reset_sentinel=reset_sentinel,
-            wait_for_close=args.wait_for_close,
-            temperature=args.temp,
-            min_p=args.min_p,
-            back_and_forth=args.back_and_forth,
-        )
+        if args.duet:
+            run_duet(
+                model=model,
+                midi_performance_queue=midi_performance_queue,
+                midi_control_queue=midi_control_queue,
+                midi_out_port=args.midi_out,
+                midi_save_path=args.save_path,
+                midi_reset_control_signal=args.midi_reset_control_signal,
+                reset_sentinel=reset_sentinel,
+                temperature=args.temp,
+                min_p=args.min_p,
+                listen_ms=args.duet_listen_ms,
+                play_ms=args.duet_play_ms,
+            )
+        else:
+            run(
+                model=model,
+                midi_performance_queue=midi_performance_queue,
+                midi_control_queue=midi_control_queue,
+                midi_through_port=args.midi_through,
+                midi_out_port=args.midi_out,
+                midi_path=args.midi_path,
+                midi_save_path=args.save_path,
+                midi_control_signal=args.midi_control_signal,
+                midi_reset_control_signal=args.midi_reset_control_signal,
+                reset_sentinel=reset_sentinel,
+                wait_for_close=args.wait_for_close,
+                temperature=args.temp,
+                min_p=args.min_p,
+                back_and_forth=args.back_and_forth,
+            )
         reset_sentinel = threading.Event()
 
 
@@ -2127,7 +2788,7 @@ def playback(midi_path: str, midi_out: str, save_path: str | None = None):
 
 
 def close_notes(midi_out_port: str):
-    with mido.open_output(midi_out_port) as out:
+    with open_output(midi_out_port) as out:
         out.send(mido.Message(type="control_change", control=64, value=0))
         for note in range(128):
             out.send(mido.Message("note_off", note=note, velocity=0))
