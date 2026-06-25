@@ -95,16 +95,7 @@
       <div id="sliders"></div>
 
       <label>Sampling <span class="r2" id="sampNote"></span></label>
-      <div class="row">
-        <span>
-          <span class="r2">temperature <b id="tempVal">0.95</b></span>
-          <input id="temp" type="range" min="0.5" max="1.4" step="0.05" value="0.95">
-        </span>
-        <span>
-          <span class="r2">top-p <b id="toppVal">0.95</b></span>
-          <input id="topp" type="range" min="0.5" max="1.0" step="0.01" value="0.95">
-        </span>
-      </div>
+      <div class="row" id="sampKnobs" style="flex-wrap:wrap"></div>
 
       <div class="row" style="margin-top:14px">
         <button id="btnGen">Generate from z + sliders</button>
@@ -158,21 +149,42 @@ async function loadModels(){
 }
 
 function curModel(){ return MODELS.find(m=>m.key===$("#modelSel").value); }
-function syncSampleVals(){
-  $("#tempVal").textContent = (+$("#temp").value).toFixed(2);
-  $("#toppVal").textContent = (+$("#topp").value).toFixed(2);
+
+// Per-knob slider spec. The GUI renders one slider per knob the model declares
+// in its `sampling` set, so the knob count adapts per model.
+const KNOB_SPEC = {
+  temperature: {label:"temperature", min:0.5, max:1.4, step:0.05, dec:2},
+  top_k:       {label:"top-k",       min:0,   max:128, step:1,    dec:0, int:true},
+  top_p:       {label:"top-p",       min:0.5, max:1.0, step:0.01, dec:2},
+  min_p:       {label:"min-p",       min:0.0, max:0.2, step:0.005, dec:3},
+};
+function fmtKnob(k,v){ const d=(KNOB_SPEC[k]||{}).dec ?? 2; return (+v).toFixed(d); }
+function buildSamplingKnobs(){
+  const s = (curModel()||{}).sampling || {};
+  const host = $("#sampKnobs"); host.innerHTML = "";
+  const order = Object.keys(s).sort((a,b)=> a==="temperature"?-1 : b==="temperature"?1 : 0);
+  for(const k of order){
+    const sp = KNOB_SPEC[k] || {label:k, min:0, max:1, step:0.01, dec:2};
+    const span = document.createElement("span");
+    span.innerHTML = `<span class="r2">${sp.label} <b id="kv_${k}">${fmtKnob(k,s[k])}</b></span>`
+      + `<input id="kn_${k}" type="range" min="${sp.min}" max="${sp.max}" step="${sp.step}" value="${s[k]}">`;
+    host.appendChild(span);
+    span.querySelector("input").oninput = (e)=>{ $("#kv_"+k).textContent = fmtKnob(k, e.target.value); };
+  }
+  $("#sampNote").textContent = "(" + order.map(k=>(KNOB_SPEC[k]||{}).label||k).join(" + ") + ")";
+}
+function collectSampling(){
+  const s = (curModel()||{}).sampling || {}; const out = {};
+  for(const k of Object.keys(s)){
+    const inp = $("#kn_"+k); if(!inp) continue;
+    out[k] = (KNOB_SPEC[k]&&KNOB_SPEC[k].int) ? Math.round(+inp.value) : +inp.value;
+  }
+  return out;
 }
 function onModelChange(){
   const m = curModel();
   $("#modelNote").textContent = m ? `[${m.backend}] ${m.notes}` : "";
-  // Apply this model's appropriate sampling defaults.
-  const s = (m && m.sampling) || {};
-  if(s.temperature!=null) $("#temp").value = s.temperature;
-  if(s.top_p!=null) $("#topp").value = s.top_p;
-  const usesMinP = m && m.backend==="mlx";   // plain-Aria realtime samples with min_p
-  $("#sampNote").textContent = m
-    ? (usesMinP ? `(temp + min_p ${s.min_p ?? 0.03})` : `(temp + top-p)`) : "";
-  syncSampleVals();
+  buildSamplingKnobs();
 }
 
 function selectMatch(sel, name){
@@ -277,10 +289,11 @@ $("#btnStart").onclick = async ()=>{
   const m = curModel();
   try{
     if(m.backend==="mlx"){
+      const samp = collectSampling();
       await jpost("/api/realtime/start", {
         model_key:m.key, midi_out:$("#midiOut").value,
-        midi_in:$("#midiIn").value||null, temperature:+$("#temp").value,
-        min_p:(m.sampling&&m.sampling.min_p!=null)?m.sampling.min_p:0.03 });
+        midi_in:$("#midiIn").value||null,
+        temperature: samp.temperature ?? 0.95, min_p: samp.min_p ?? 0.03 });
       log(`Started realtime engine: ${m.display_name}. Play your keyboard.`);
       $("#latentBody").classList.add("hide"); $("#latentHint").classList.remove("hide");
       $("#latentHint").textContent="Plain-Aria realtime model running (no sliders).";
@@ -308,8 +321,9 @@ $("#btnEncode").onclick = async ()=>{
 
 async function generate(useRandom){
   try{
-    const body = { offsets: collectOffsets(), temperature:+$("#temp").value,
-      top_p:+$("#topp").value, use_random_z:!!useRandom };
+    const body = Object.assign(
+      { offsets: collectOffsets(), use_random_z:!!useRandom },
+      collectSampling());
     if($("#playVirt").checked && $("#vOutName").value.trim())
       body.output_port = $("#vOutName").value.trim();
     const r = await jpost("/api/latent/generate", body);
@@ -321,8 +335,6 @@ async function generate(useRandom){
 }
 $("#btnGen").onclick  = ()=>generate(false);
 $("#btnRand").onclick = ()=>generate(true);
-$("#temp").oninput = syncSampleVals;
-$("#topp").oninput = syncSampleVals;
 $("#btnVOut").onclick = async ()=>{
   const name = $("#vOutName").value.trim(); if(!name) return;
   try{

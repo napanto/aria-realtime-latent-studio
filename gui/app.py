@@ -81,7 +81,8 @@ class LatentEncode(BaseModel):
 class LatentGenerate(BaseModel):
     offsets: dict[str, float] = {}   # attr -> alpha (slider value)
     temperature: float = 0.95
-    top_p: float = 0.9
+    top_p: float = 1.0               # AriaVAE nucleus (1.0 = off)
+    top_k: int = 0                   # Cadenza top-k (0 = off)
     use_random_z: bool = False
     output_port: Optional[str] = None  # if set, also play the result out this port
 
@@ -366,6 +367,7 @@ def api_latent_generate(req: LatentGenerate) -> FileResponse:
         str(out),
         temperature=req.temperature,
         top_p=req.top_p,
+        top_k=req.top_k,
     )
     # Optionally also play it out a (virtual or real) server-side MIDI port.
     if req.output_port:
