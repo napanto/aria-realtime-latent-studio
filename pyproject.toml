@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aria-realtime-studio"
+version = "0.1.0"
+description = "macOS/Apple-Silicon real-time Aria piano-continuation app (two MLX models, grammar-constrained decoding)"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Antonio Napolitano", email = "anton@polit.no" }]
+dependencies = [
+    "numpy>=1.24",
+    "mido>=1.3",
+    "python-rtmidi>=1.5",
+    "huggingface_hub>=0.23",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+# Apple-Silicon real-time MLX path (the two Aria models). macOS/arm64 only.
+mlx = [
+    "mlx<=0.26",
+    "aria @ git+https://github.com/EleutherAI/aria",
+    "ariautils @ git+https://github.com/EleutherAI/aria-utils",
+]
+
+[project.scripts]
+latent-studio = "gui.app:main"
+
+[tool.setuptools]
+packages = ["studio", "models", "realtime", "gui"]
