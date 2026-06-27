@@ -84,6 +84,11 @@ DUET_MAX_CATCHUP_MS: int = 4000
 MIN_NOTE_DELTA_MS: int = 0
 MIN_PEDAL_DELTA_MS: int = 0
 MIN_NOTE_LENGTH_MS: int = 10
+# Upper bound on how long a note-off may be deferred to preserve its intended
+# audible duration when the decode falls behind real-time (see stream_midi).
+# The AbsTokenizer caps a single note duration at 5000ms, so this never clips a
+# legitimate note; it only guards against a malformed token group.
+MAX_NOTE_HOLD_MS: int = 5000
 HARDWARE_INPUT_LATENCY_MS: int = 0
 BASE_OUTPUT_LATENCY_MS: int = 0
 VELOCITY_OUTPUT_LATENCY_MS: dict[int, int] = {v: 0 for v in range(0, 127, 10)}
@@ -1406,6 +1411,14 @@ def stream_midi(
     active_pitch_uuid = {}
     pending_msgs = []
     msgs_to_archive = []
+    # Per-note bookkeeping for duration preservation. When the decode falls
+    # behind, a note's onset AND offset both sit in the past, so a naive
+    # scheduler fires the note-off immediately after the note-on and the note
+    # collapses to a click — turning a held chord into a machine-gun arpeggio.
+    # We remember when each note-on was *actually* played and hold its note-off
+    # until the note has sounded for its intended duration.
+    on_play_wall_ms = {}   # uuid -> wall time the note-on was actually sent
+    on_epoch_ms = {}       # uuid -> the note-on's intended epoch_time_ms
     # When the decode falls behind real-time, we don't DROP notes (that's just
     # silence) — we stretch the playback timeline by the accumulated lag so the
     # stream keeps playing at the decode's pace with relative rhythm intact.
@@ -1425,19 +1438,49 @@ def stream_midi(
 
             pending_msgs.sort(key=lambda m: (m["send_epoch_time_ms"], m["vel"]))
 
-            while pending_msgs:
+            # Drain by index (not pop-front + break): a note-off may be held
+            # into the future to preserve its note's duration, and that must NOT
+            # block the note-ons sorted behind it (which keep the line flowing).
+            i = 0
+            while i < len(pending_msgs):
                 curr_epoch_time_ms = get_epoch_time_ms()
-                msg = pending_msgs[0]
+                msg = pending_msgs[i]
 
                 eff_send_ms = msg["send_epoch_time_ms"] + schedule_offset_ms
+
+                # Duration preservation. A note-off's absolute schedule sits in
+                # the past once the decode is behind, which would fire it right
+                # after its note-on (a click). Instead, hold the off until its
+                # own note-on has actually sounded for the intended duration.
+                is_note_off = msg["vel"] == 0 and msg["pitch"] != "pedal"
+                if (
+                    is_note_off
+                    and not msg.get("adjusted", False)
+                    and msg["uuid"] in on_play_wall_ms
+                ):
+                    intended_dur_ms = msg["epoch_time_ms"] - on_epoch_ms.get(
+                        msg["uuid"], msg["epoch_time_ms"]
+                    )
+                    intended_dur_ms = max(
+                        MIN_NOTE_LENGTH_MS, min(intended_dur_ms, MAX_NOTE_HOLD_MS)
+                    )
+                    hold_until_ms = on_play_wall_ms[msg["uuid"]] + intended_dur_ms
+                    eff_send_ms = max(eff_send_ms, hold_until_ms)
+
                 if eff_send_ms > curr_epoch_time_ms:
-                    break
+                    # Not due yet. Skip it and keep draining the rest -- a held
+                    # note-off must not stall the note-ons after it.
+                    i += 1
+                    continue
+
                 late_ms = curr_epoch_time_ms - eff_send_ms
-                if late_ms > MAX_STREAM_DELAY_MS:
+                if late_ms > MAX_STREAM_DELAY_MS and msg["vel"] > 0:
                     # Decode fell behind real-time: stretch the whole timeline by
                     # the lag (instead of dropping the note -> silence). All
                     # remaining notes shift by the same amount, so the music keeps
                     # playing at the decode pace with its relative rhythm intact.
+                    # Driven by onsets only -- held note-offs are intentionally in
+                    # the future and must not inflate the reported lag.
                     schedule_offset_ms += late_ms
                     # Report lag BEYOND the intentional phrase lead (so a buffered
                     # phrase reads as in-sync until the decode falls behind it).
@@ -1461,6 +1504,9 @@ def stream_midi(
                     active_pitch_uuid[msg["pitch"]] = msg["uuid"]
                     should_send = True
                     should_archive = True
+                    if msg["pitch"] != "pedal":
+                        on_play_wall_ms[msg["uuid"]] = curr_epoch_time_ms
+                        on_epoch_ms[msg["uuid"]] = msg["epoch_time_ms"]
                 else:  # note-off or pedal-off (vel == 0)
                     if msg.get("adjusted", False):
                         should_send = True
@@ -1469,6 +1515,8 @@ def stream_midi(
                         should_send = True
                         should_archive = True
                         active_pitch_uuid.pop(msg["pitch"], None)
+                    on_play_wall_ms.pop(msg["uuid"], None)
+                    on_epoch_ms.pop(msg["uuid"], None)
 
                 if should_send:
                     mido_msg = _create_mido_message(
@@ -1480,7 +1528,7 @@ def stream_midi(
                 if should_archive:
                     msgs_to_archive.append(msg)
 
-                pending_msgs.pop(0)
+                pending_msgs.pop(i)
 
             if control_sentinel.is_set():
                 break
